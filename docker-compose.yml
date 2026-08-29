@@ -26,7 +26,7 @@ services:
     ports:
       # Bound to loopback on purpose: Hound's HTTP endpoint has no
       # authentication. Change to "8765:8765" only on a trusted network.
-      - "0.0.0.0:8765:8765"
+      - "127.0.0.1:8765:8765"
 
     # Stealthy fetches return anti-adblock overlays / 'CSS onerror' error pages → network-level ad-blocking
     # (Pi-hole, AdGuard) is filtering the browser's subresources; give the container its own dns: entries.
