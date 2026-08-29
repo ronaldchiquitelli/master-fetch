@@ -3086,63 +3086,21 @@ class MasterFetchServer:
             # Streamable HTTP transport (MCP 2025-03-26 spec). This is the
             # transport Open WebUI (v0.6.31+) and other modern HTTP MCP clients
             # connect to directly, no mcpo proxy needed. Endpoint: http://host:port/mcp
-            from contextlib import asynccontextmanager
-            from starlette.applications import Starlette
-            from starlette.routing import Route
             import uvicorn
 
-            # MCP SDK 2.x: `streamable_http_app()` builds the ASGI app that wires
-            # the streamable-HTTP session manager, the /mcp route, streamable-HTTP
-            # limits and (for localhost hosts) DNS-rebinding protection. It stores
-            # the manager on server._session_manager so its lifespan can be entered
-            # alongside our prewarm/teardown below.
-            inner_app = server.streamable_http_app(streamable_http_path="/mcp", host=host)
-            session_manager = getattr(server, "_session_manager", None)
-
-            # Repass the ASGI scope untouched so inner_app handles its own /mcp
-            # routing; this app wrapper only adds our lifespan on top of the SDK's.
-            async def _asgi_entry(scope, receive, send):
-                await inner_app(scope, receive, send)
-
-            @asynccontextmanager
-            async def lifespan(app):
-                # Warm the single stealthy browser + reranker at startup.
-                warm = asyncio.create_task(self._prewarm_stealthy())
-                warm_reranker = asyncio.create_task(
-                    _safe_imported_prewarm("master_fetch.reranker", "prewarm_reranker")
-                )
-                try:
-                    # inner_app is mounted as a sub-app so its own lifespan is not
-                    # auto-entered; drive the SDK's session manager manually.
-                    if session_manager is not None:
-                        async with session_manager.run():
-                            yield
-                    else:
-                        yield
-                finally:
-                    # Bulletproof teardown: cancel prewarm tasks + close sessions,
-                    # swallowing EVERYTHING (including 'Event loop is closed' and
-                    # BaseException) so the process always exits cleanly. A noisy
-                    # teardown traceback must never look like a server crash.
-                    for _t in (warm, warm_reranker):
-                        try:
-                            _t.cancel()
-                        except BaseException:
-                            pass
-                    for _t in (warm, warm_reranker):
-                        try:
-                            await _t
-                        except BaseException:
-                            pass
-                    try:
-                        await self._shutdown_close_sessions()
-                    except BaseException:
-                        pass
-
-            app = Starlette(
-                routes=[Route("/{full_path:path}", endpoint=_asgi_entry)],
-                lifespan=lifespan,
-            )
+            # MCP SDK 2.x: `streamable_http_app()` builds a complete streamable-HTTP
+            # ASGI app (session manager + its lifespan, the /mcp route, DNS-rebinding
+            # protection for localhost). Run it directly as the uvicorn app — wrapping
+            # it in an outer Starlette/Route caused HTTP 405 in this SDK.
+            #
+            # Note: we intentionally use the blocking `uvicorn.run()` here instead of
+            # driving `uvicorn.Server.serve()` from our own asyncio loop: the SDK's
+            # streamable-HTTP session-manager lifespan did not serve requests when
+            # awaited inside a coexisting loop, whereas running it directly is stable.
+            # The prewarm/teardown hooks that the v1 HTTP bundle used are therefore not
+            # run here; the stealthy browser is still auto-managed (launched on demand
+            # and closed by the idle monitor), so server stability is unaffected.
+            app = server.streamable_http_app(streamable_http_path="/mcp", host=host)
             uvicorn.run(app, host=host, port=port)
 
     async def _dispatch(self, name: str, args: dict) -> list | tuple:
