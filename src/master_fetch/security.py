@@ -127,6 +127,24 @@ def _normalize_ip_notation(host: str) -> str | None:
         return None
 
 
+def _resolve_host_ips(hostname: str) -> list[str]:
+    """Resolve a hostname to all A/AAAA records.
+
+    Best-effort: returns [] on failure so the caller can fall back to
+    the static blocklist. NOTE: this reduces but does not eliminate SSRF —
+    a rebinding attacker can answer with a public IP here and a private
+    IP for the fetcher's own resolution (TOCTOU). Complete closure requires
+    pinning the resolved IP to the connection or network-layer egress
+    control.
+    """
+    import socket
+    try:
+        infos = socket.getaddrinfo(hostname, None)
+    except (socket.gaierror, socket.herror, OSError):
+        return []
+    return [info[4][0] for info in infos]
+
+
 def validate_url(url: str, allow_internal: bool = False) -> str:
     """Validate and sanitize a URL. Returns the validated URL.
 
@@ -253,6 +271,22 @@ def validate_url(url: str, allow_internal: bool = False) -> str:
             # Block DNS rebinding services that resolve to internal IPs
             if hostname_lower.endswith(_DNS_REBINDING_SUFFIXES):
                 raise SecurityError(f"URL uses DNS rebinding service: {hostname}")
+            # Resolve the name and reject if ANY resolved address is private.
+            # Partial mitigation for the DNS-blind gap (does not stop rebinding).
+            for resolved in _resolve_host_ips(hostname):
+                try:
+                    ip = ipaddress.ip_address(resolved.split('%')[0])
+                except ValueError:
+                    continue
+                check = ip.ipv4_mapped if (isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped) else ip
+                for network in _PRIVATE_NETWORKS:
+                    try:
+                        if check in network:
+                            raise SecurityError(
+                                f"URL hostname {hostname} resolves to internal/private IP {resolved} (in {network})"
+                            )
+                    except TypeError:
+                        pass
 
     return url
 

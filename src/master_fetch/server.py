@@ -146,6 +146,7 @@ if TYPE_CHECKING:
     from master_fetch.fetcher import Response as _HoundResponse
     from master_fetch.browser import StealthyBrowser, DynamicBrowser
     from master_fetch.search import SearchResponseModel
+    from mcp.server.mcpserver import Image
     from mcp.types import ImageContent, TextContent
 
 from master_fetch.cache import get_cached, set_cached, clear_cache, clear_all_cache, DEFAULT_TTL
@@ -195,10 +196,13 @@ AUTO_SESSION_IDLE_TIMEOUT = _env_int("HOUND_BROWSER_IDLE_TIMEOUT", 300)
 IDLE_CHECK_INTERVAL = 60  # How often to check for idle sessions (seconds)
 
 # MCP initialize `instructions` — injected into the agent's context ONCE on
-# connect by clients that support it. This is the connect-time mastery doc:
-# the #1 workflow, the gotchas, and when to use each tool. Kept tight (~300
-# tokens) since it is paid once, not per-turn-per-tool.
-HOUND_INSTRUCTIONS = ""
+# connect, then lost on the first context compaction. Deliberately near-
+# empty: durable guidance lives in the per-tool definitions, which are
+# re-injected every turn. Only the two signals an agent must never miss.
+HOUND_INSTRUCTIONS = (
+    "Hound tools: check content_ok before trusting content; "
+    "follow next_action for the next call."
+)
 
 class ResponseModel(BaseModel):
     """Request's response information structure."""
@@ -246,6 +250,11 @@ class ResponseModel(BaseModel):
     # real page. Honest marking so the agent knows it may be a dated snapshot.
     source: str = Field(default="live", description="'live' (default) = fetched from the real URL. 'archive.org' = the live site hard-blocked and this content was recovered from the Internet Archive's closest snapshot (see archived_at for the snapshot date).")
     archived_at: str = Field(default="", description="ISO date of the archive.org snapshot when source='archive.org'. Empty when source='live'. The content reflects the page as it was on this date.")
+    # network: XHR bodies captured during a browser fetch. Populated when
+    # capture_xhr=true, or automatically when an AJAX shell is detected (a page
+    # whose data panels load over XHR after render). Kept OUT of `content` so
+    # extraction stays predictable; fold_captured=true merges it in instead.
+    network: Dict[str, Any] = Field(default_factory=dict, description="XHR/fetch fragments captured while rendering (only when capture_xhr=true or an AJAX shell was auto-detected): {fragments:[{url,status,content_type,size_bytes,text,is_primary,text_truncated}], primary_url, captured_count}. The fragment with is_primary=true is the page's data payload — for a page whose numbers arrive over XHR, that fragment holds them while `content` holds only boilerplate. Empty when nothing was captured.")
 
 
 class BulkResponseModel(BaseModel):
@@ -370,12 +379,52 @@ def _is_cloudflare_from_response(result: ResponseModel) -> bool:
     return any(signal in content_str for signal in all_signals)
 
 
+_DETERMINISTIC_NET_SIGNALS = (
+    "name or service not known",
+    "nodename nor servname",
+    "temporary failure in name resolution",
+    "getaddrinfo",
+    "name resolution",
+    "connection refused",
+    "econnrefused",
+)
+
+
+def _is_deterministic_net_msg(msg: str) -> bool:
+    """True if an error message is a transport failure no retry and no
+    browser can fix (DNS resolution, refused connection)."""
+    return any(s in msg.lower() for s in _DETERMINISTIC_NET_SIGNALS)
+
+
+def _is_deterministic_net_error(result: ResponseModel) -> bool:
+    """True for transport failures a browser retry cannot fix either:
+    DNS resolution (the host doesn't exist) and refused connections
+    (nothing listening - from this same IP a browser gets refused too).
+    Everything else at status 0 (TLS fingerprint blocks, resets, timeouts)
+    is worth a stealthy attempt."""
+    if result.status != 0:
+        return False
+    err = (result.error or "").lower()
+    if not err and result.content:
+        err = result.content[0].lower()
+    return any(s in err for s in _DETERMINISTIC_NET_SIGNALS)
+
+
 def _is_js_shell(result: ResponseModel) -> bool:
     """Check if a response contains only a JS-only placeholder, not real content.
 
     Used by smart_fetch to decide whether to escalate from HTTP to stealthy.
     Pre-v3.5 callers may have passed through dynamic as an intermediate step.
     """
+    # JS-shell detection is an HTML concept. Non-HTML documents (PDFs, images,
+    # JSON, feeds, plain text) cannot be JS shells, and the text-ratio
+    # heuristic below misfires on them: a scanned PDF has a large binary body
+    # but little extractable text, which is indistinguishable from an SPA shell
+    # by ratio alone. Only apply when content_type is known to be HTML; an
+    # empty/unknown content_type falls through to the existing logic.
+    ct = (result.content_type or "").split(";")[0].strip().lower()
+    if ct and ct not in ("text/html", "application/xhtml+xml"):
+        return False
     content_str = " ".join(result.content).lower().strip()
     if not content_str:
         return True  # Empty content after extraction = JS shell or blank page
@@ -477,6 +526,41 @@ def _is_cacheable(result: ResponseModel) -> bool:
     return False
 
 
+_AJAX_SHELL_ERROR = (
+    "ajax_shell_detected: the page fills its data panels over XHR after render, "
+    "so content holds only the surrounding boilerplate"
+)
+
+
+def _apply_capture_verdict(
+    result: ResponseModel,
+    fold_captured: bool,
+    shell_detected: bool = False,
+) -> ResponseModel:
+    """Decide what a capture pass means for content/error on a result.
+
+    By default captured data stays in `network` and, when the page was an AJAX
+    shell, the result is marked so `content_ok` goes False — the agent is told
+    plainly that `content` is boilerplate and where the real data is. With
+    fold_captured the primary fragment is merged into content instead.
+    """
+    frags = (result.network or {}).get("fragments") or []
+    primary = next((f for f in frags if f.get("is_primary")), None)
+
+    if fold_captured and primary and primary.get("text"):
+        result.content = list(result.content) + [
+            f"\n\n--- captured from {primary.get('url', '')} ---\n{primary['text']}"
+        ]
+        return result
+
+    if shell_detected and not result.error:
+        if primary:
+            result.error = _AJAX_SHELL_ERROR + "; the data is in network.fragments"
+        else:
+            result.error = _AJAX_SHELL_ERROR + "; no data-bearing XHR was captured"
+    return result
+
+
 def _format_size(n: int) -> str:
     """Human-readable byte size for the summary line."""
     if not n:
@@ -532,6 +616,19 @@ def _agent_hints(result: ResponseModel) -> tuple[str, str, bool]:
         next_action = f"page truncated. Use focus='query' to extract only relevant blocks, or offset={result.next_offset} to continue paginating"
     elif err == "robots_txt_disallowed":
         next_action = "blocked by robots.txt: set options.respect_robots=false to bypass"
+    elif err.startswith("ajax_shell_detected"):
+        primary_url = (result.network or {}).get("primary_url", "")
+        if primary_url:
+            next_action = (
+                f"content is boilerplate; the page's data is in network.fragments "
+                f"(primary_url={primary_url}). Read that fragment, or fetch that URL "
+                f"directly for just the data"
+            )
+        else:
+            next_action = (
+                "page loads its data over XHR but none was captured; retry with "
+                "capture_pattern to widen the filter, or find the data endpoint"
+            )
     elif err.startswith("js_shell_detected"):
         next_action = "page is a JS shell; re-fetch auto-escalates to the stealthy browser"
     elif err.startswith("bot_challenge_detected"):
@@ -732,6 +829,10 @@ _FOCUS: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar("_focus",
 # Opt-in: populate ResponseModel.media with the page's image URLs (multimodal).
 _INCLUDE_MEDIA: contextvars.ContextVar[bool] = contextvars.ContextVar("_include_media", default=False)
 _INCLUDE_LINKS: contextvars.ContextVar[bool] = contextvars.ContextVar("_include_links", default=False)
+# Set by _translate_response (the only place the raw body is still around) so
+# _auto_escalate can tell an AJAX shell from a genuinely thin page without
+# re-parsing. Task-local, like the options above.
+_AJAX_SHELL: contextvars.ContextVar[bool] = contextvars.ContextVar("_ajax_shell", default=False)
 
 
 def _smart_fetch_request_context(func):
@@ -825,6 +926,62 @@ def _extract_pdf_response(body: bytes, raw_ct: str, total_size: int, url: str,
 
 
 def _translate_response(
+    page: _ScraplingResponse,
+    extraction_type: str,
+    css_selector: Optional[str],
+    main_content_only: bool,
+    use_trafilatura: bool = False,
+    fetcher_used: str = "",
+    duration_ms: float = 0,
+) -> ResponseModel:
+    """Translate a fetched response, attaching any captured XHR fragments.
+
+    Wraps the extraction pipeline so every return path (HTML, JSON, PDF,
+    image) carries the `network` envelope when the browser captured XHR
+    bodies. Extraction itself is unchanged — captured data never touches
+    `content` here; folding it in is an explicit opt-in upstream.
+    """
+    model = _translate_response_inner(
+        page, extraction_type, css_selector, main_content_only,
+        use_trafilatura, fetcher_used, duration_ms,
+    )
+
+    # AJAX-shell verdict: the raw body is only available here. Recorded for
+    # _auto_escalate, which decides whether a capture pass is worth it.
+    try:
+        raw_ct = (getattr(page, "headers", {}) or {}).get("content-type", "")
+        if raw_ct.startswith("text/html") or (not raw_ct and model.status == 200):
+            from master_fetch.network_capture import detect_ajax_shell
+            _AJAX_SHELL.set(detect_ajax_shell(page.content, " ".join(model.content)))
+        else:
+            _AJAX_SHELL.set(False)
+    except Exception:
+        _AJAX_SHELL.set(False)
+
+    captured = getattr(page, "captured", None)
+    if captured:
+        from master_fetch.network_capture import analyze_fragment, build_network_field
+        fragments = []
+        for frag in captured:
+            body = frag.get("_body", "")
+            ct = frag.get("content_type", "")
+            analyzed = analyze_fragment(body, ct)
+            fragments.append({
+                "url": frag.get("url", ""),
+                "status": frag.get("status", 0),
+                "content_type": ct,
+                "size_bytes": frag.get("size_bytes", 0),
+                "text": analyzed["text"],
+                "from_script": analyzed["from_script"],
+                "_raw": body,
+            })
+        network = build_network_field(fragments)
+        if network:
+            model.network = network
+    return model
+
+
+def _translate_response_inner(
     page: _ScraplingResponse,
     extraction_type: str,
     css_selector: Optional[str],
@@ -1219,21 +1376,27 @@ class MasterFetchServer:
             # Create outside the sessions lock (expensive — browser launch) but
             # inside the creation lock (no concurrent 2nd launch).
             sid = await self.open_session(session_type=session_type, headless=True)
+            orphan = None
             async with self._sessions_lock:
                 existing_id = getattr(self, attr)
                 if existing_id and existing_id in self._sessions and self._sessions[existing_id].session._is_alive:
-                    try:
-                        await self.close_session(sid.session_id)
-                    except Exception:
-                        pass  # Best effort cleanup
-                    setattr(self, ts_attr, now())
-                    self._ensure_idle_monitor()
-                    return existing_id
-                setattr(self, attr, sid.session_id)
+                    # Another creator won: reuse its session. Pop the orphan
+                    # inside the lock but CLOSE it outside - close_session
+                    # re-acquires _sessions_lock and would deadlock here.
+                    orphan = self._sessions.pop(sid.session_id, None)
+                    result_id = existing_id
+                else:
+                    setattr(self, attr, sid.session_id)
+                    result_id = sid.session_id
                 setattr(self, ts_attr, now())
+        if orphan is not None:
+            try:
+                await orphan.session.close()
+            except Exception:
+                pass  # Best effort cleanup
 
         self._ensure_idle_monitor()
-        return sid.session_id
+        return result_id
 
     async def _prewarm_stealthy(self) -> None:
         """Warm the single stealthy browser at startup (background, best-effort).
@@ -1697,10 +1860,9 @@ class MasterFetchServer:
         if "bytes" not in captured:
             raise RuntimeError(f"Failed to capture screenshot for {url}")
 
-        import base64
-        from mcp.types import ImageContent, TextContent  # lazy: only needed for screenshot output
-        image_b64 = base64.b64encode(captured["bytes"]).decode("ascii")
-        image = ImageContent(type="image", data=image_b64, mime_type=f"image/{image_type}")
+        from mcp.server.mcpserver import Image  # lazy: mcpserver is ~1s to import, only needed for screenshots
+        from mcp.types import TextContent  # lazy: mcp.types is ~1s; only needed for screenshot output
+        image = Image(data=captured["bytes"], format=image_type).to_image_content()
         return [image, TextContent(type="text", text=captured["url"])]
 
     # ─── HTTP Fetcher (curl_cffi) ─────────────────────────────────
@@ -1718,7 +1880,7 @@ class MasterFetchServer:
         cookies: Optional[Dict[str, str]] = None,
         timeout: Optional[int | float] = 30,
         follow_redirects: FollowRedirects = "safe",
-        max_redirects: int = 30,
+        max_redirects: int = 5,
         retries: Optional[int] = 3,
         retry_delay: Optional[int] = 1,
         proxy: Optional[str] = None,
@@ -1743,7 +1905,7 @@ class MasterFetchServer:
         :param cookies: Request cookies.
         :param timeout: Timeout in seconds (default 30).
         :param follow_redirects: Redirect policy: 'safe', True, or False.
-        :param max_redirects: Max redirects (default 30).
+        :param max_redirects: Max redirects (default 5).
         :param retries: Retry attempts (default 3).
         :param retry_delay: Seconds between retries (default 1).
         :param proxy: Proxy URL.
@@ -1784,7 +1946,7 @@ class MasterFetchServer:
         cookies: Optional[Dict[str, str]] = None,
         timeout: Optional[int | float] = 30,
         follow_redirects: FollowRedirects = "safe",
-        max_redirects: int = 30,
+        max_redirects: int = 5,
         retries: Optional[int] = 3,
         retry_delay: Optional[int] = 1,
         proxy: Optional[str] = None,
@@ -1808,7 +1970,7 @@ class MasterFetchServer:
         :param cookies: Request cookies.
         :param timeout: Timeout in seconds (default 30).
         :param follow_redirects: Redirect policy.
-        :param max_redirects: Max redirects (default 30).
+        :param max_redirects: Max redirects (default 5).
         :param retries: Retry attempts (default 3).
         :param retry_delay: Seconds between retries (default 1).
         :param proxy: Proxy URL.
@@ -2084,6 +2246,8 @@ class MasterFetchServer:
         additional_args: Optional[Dict] = None,
         session_id: Optional[str] = None,
         page_action=None,
+        capture_xhr: bool = False,
+        capture_pattern: Optional[str] = None,
     ) -> ResponseModel:
         """Stealthy fetcher with anti-bot bypass via Patchright (rebrowser-playwright fork).
 
@@ -2150,6 +2314,7 @@ class MasterFetchServer:
             allow_webgl=allow_webgl, solve_cloudflare=solve_cloudflare,
             additional_args=additional_args, session_id=session_id,
             page_action=page_action,
+            capture_xhr=capture_xhr, capture_pattern=capture_pattern,
         )
         result = bulk.results[0]
         result.duration_ms = (now() - t0) * 1000
@@ -2185,6 +2350,8 @@ class MasterFetchServer:
         additional_args: Optional[Dict] = None,
         session_id: Optional[str] = None,
         page_action=None,
+        capture_xhr: bool = False,
+        capture_pattern: Optional[str] = None,
     ) -> BulkResponseModel:
         """Async parallel stealthy fetch with browser fingerprint randomization.
 
@@ -2214,6 +2381,8 @@ class MasterFetchServer:
         :param wait_selector_state: Selector wait state.
         :param additional_args: Extra Playwright context args.
         :param session_id: Reuse existing browser session.
+        :param capture_xhr: Capture XHR/fetch bodies into each result's network field.
+        :param capture_pattern: Regex selecting which request URLs to capture.
         """
         urls = [validate_url(u) for u in urls]
         if len(urls) > MAX_BULK_URLS:
@@ -2241,6 +2410,7 @@ class MasterFetchServer:
                     wait_selector=wait_selector, wait_selector_state=wait_selector_state,
                     network_idle=network_idle, proxy=proxy, solve_cloudflare=solve_cloudflare,
                     page_action=page_action,
+                    capture_xhr=capture_xhr, capture_pattern=capture_pattern,
                 ))
                 for url in urls
             ]
@@ -2259,7 +2429,13 @@ class MasterFetchServer:
                 disable_resources=disable_resources,
                 wait_selector_state=wait_selector_state,
             ) as session:
-                timed_tasks = [_timed(session.fetch(url, page_action=page_action)) for url in urls]
+                timed_tasks = [
+                    _timed(session.fetch(
+                        url, page_action=page_action,
+                        capture_xhr=capture_xhr, capture_pattern=capture_pattern,
+                    ))
+                    for url in urls
+                ]
                 timed_responses = await gather(*timed_tasks, return_exceptions=True)
 
         results = []
@@ -2277,7 +2453,7 @@ class MasterFetchServer:
                             page, extraction_type, css_selector, main_content_only, use_tf, "stealthy", elapsed,
                         )
                     ))
-        successful = sum(1 for r in results if r.status < 400 and not r.error)
+        successful = sum(1 for r in results if 0 < r.status < 400 and not r.error)
         return BulkResponseModel(results=results, total=len(results), successful=successful)
 
     # ─── SMART FETCH (The One Tool To Rule Them All) ────────────────
@@ -2293,7 +2469,14 @@ class MasterFetchServer:
         max_retries = 3
         base_delay = 1.0
         last_error = None
+        attempts = 0
+        # self.get retries internally (default 3x); this outer loop IS the
+        # retry policy (backoff + deterministic-error bail-out), so disable
+        # the inner one. Nested, they made 4 x 4 = 16 identical requests
+        # against a blocking site before escalation ever ran.
+        kwargs.setdefault("retries", 0)
         for attempt in range(max_retries + 1):
+            attempts = attempt + 1
             try:
                 return await self.get(url, **kwargs)
             except (SecurityError, ValueError):
@@ -2301,6 +2484,10 @@ class MasterFetchServer:
                 raise
             except Exception as e:
                 last_error = e
+                # DNS failure / connection refused: identical retries
+                # cannot help. Bail to the escalation path immediately.
+                if _is_deterministic_net_msg(str(e)):
+                    break
                 if attempt < max_retries:
                     delay = base_delay * (2 ** attempt)
                     logger.warning(
@@ -2329,7 +2516,7 @@ class MasterFetchServer:
             extracted_type=kwargs.get("extraction_type", "markdown"),
             session_id="", duration_ms=0,
             error=redact_api_key(str(last_error)[:200]),
-            retry_count=max_retries + 1,
+            retry_count=attempts,
         )
 
     @_smart_fetch_request_context
@@ -2361,9 +2548,12 @@ class MasterFetchServer:
         pages: Annotated[Optional[str], Field(description="PDF only: page spec like '1-5' or '1,3,5-7' to extract a subset of pages (saves tokens/time on big PDFs). None = all pages.")] = None,
         password: Annotated[Optional[str], Field(description="PDF only: password for an encrypted PDF.")] = None,
         focus: Annotated[Optional[str], Field(description="Query-focused extraction: pass a query and only the BM25-relevant blocks (paragraphs/headings/tables) are returned, saving context on long pages. Works post-cache, so it never triggers a re-fetch. Re-pass the same focus when paginating with offset. Empty = full page.")] = None,
-        actions: Annotated[Optional[List[Dict[str, Any]]], Field(description="Page interactions run on the stealthy browser AFTER load, BEFORE extraction: [{click:'button.load-more'}, {fill:{selector:'#q', text:'x'}}, {press:'Enter'}, {wait:500}, {scroll:3}, {wait_selector:'.item'}]. Forces the stealthy tier; bypasses cache. Reaches content behind a click/form/infinite scroll.")] = None,
+        actions: Annotated[Optional[List[Dict[str, Any]]], Field(description="Page interactions run on the stealthy browser AFTER load, BEFORE extraction: [{click:'button.load-more'}, {fill:{selector:'#q', text:'x'}}, {press:'Enter'}, {wait:500}, {scroll:3}, {wait_selector:'.item'}]. Forces the stealthy tier; bypasses cache. Reaches content behind a click/form/infinite scroll. Combine with capture_xhr=true to grab the XHR responses those interactions fire (data that only loads on click/scroll/tab-switch) — the capture waits for post-interaction requests to settle.")] = None,
         include_media: Annotated[bool, Field(description="If true, populate the response .media field with up to 20 image URLs found on the page (for multimodal agents). Default false (keeps responses lean).")] = False,
         include_links: Annotated[bool, Field(description="If true, populate the response .links field with the page's outgoing links classified as citations/navigation/external + a primary_source hint. Default false. Use when you want to follow a page's referenced sources in one step.")] = False,
+        capture_xhr: Annotated[bool, Field(description="Capture the XHR/fetch responses the page makes while rendering, into the .network field. Forces the browser tier. Use for pages whose data (prices, forecasts, tables) arrives over XHR after load and so never appears in the HTML. Auto-enabled when an AJAX shell is detected, so you rarely need to set it. Pass with actions=[...] to also capture XHRs fired by clicks/scroll/tab-switches (data behind an interaction).")] = False,
+        capture_pattern: Annotated[Optional[str], Field(description="Regex to select which request URLs to capture (e.g. 'ajax_pub|/api/'). Only used with capture_xhr. Omit to let hound filter out analytics/ads and keep plausible data endpoints.")] = None,
+        fold_captured: Annotated[bool, Field(description="Merge the primary captured XHR fragment into content instead of leaving it in .network only. Default false (content stays exactly what the page rendered).")] = False,
     ) -> ResponseModel:
         """Fetch a URL (or multiple URLs) with automatic anti-bot escalation.
 
@@ -2386,6 +2576,11 @@ class MasterFetchServer:
         Signals to branch on: content_ok (real content, not a login/bot wall?), next_action
         (suggested next call), summary, page_type (article/docs/list/forum/auth_wall/paywall/...),
         content_age_days + is_stale, source_type + is_official, source + archived_at.
+
+        AJAX shells: some pages render complete-looking HTML whose data panels are
+        filled in later over XHR. Those return boilerplate in content and the real
+        data in .network (see capture_xhr) — check .network when content reads like
+        help text with no numbers.
         """
         # Bulk mode: fetch multiple URLs in parallel
         if urls is not None:
@@ -2421,6 +2616,10 @@ class MasterFetchServer:
         # actions produce post-interaction content unique to the action sequence;
         # bypass the cache so a plain (pre-action) cached copy is never served.
         if actions:
+            cache_ttl = 0
+        # Captured fragments are not part of the cached envelope, so a cache hit
+        # would silently return an empty .network. Explicit capture skips cache.
+        if capture_xhr:
             cache_ttl = 0
 
         # 1. Check robots.txt compliance
@@ -2473,6 +2672,9 @@ class MasterFetchServer:
         # 3.5. actions: page interactions (click/fill/press/wait/scroll) require
         # the stealthy browser tier. Force it, bypass cache (post-action content
         # is unique to the action sequence), and pass a page_action callable.
+        # capture_xhr composes here: the response hook is live for the whole page
+        # lifetime, so XHRs fired BY the interactions are captured too. This is
+        # the path for data that only loads on click / scroll / tab-switch.
         if actions:
             if force_fetcher == "http":
                 raise ValueError("actions require the browser tier; use force_fetcher='stealthy' or omit it")
@@ -2486,15 +2688,24 @@ class MasterFetchServer:
                 proxy, timeout, network_idle, solve_cloudflare, block_webrtc,
                 hide_canvas, extra_headers, useragent, cookies, mc,
                 page_action=page_action,
+                capture_xhr=capture_xhr, capture_pattern=capture_pattern,
+                fold_captured=fold_captured,
             )
 
+        # 3.6. capture_xhr needs a page that actually runs JS and issues the
+        # requests, so it pins the browser tier the same way actions do.
+        if capture_xhr and force_fetcher == "http":
+            raise ValueError("capture_xhr requires the browser tier; use force_fetcher='stealthy' or omit it")
+
         # 4. Force specific fetcher (explicit pin wins; uses rewritten url)
-        if force_fetcher:
+        if force_fetcher or capture_xhr:
             return await self._force_fetch(
-                url, force_fetcher, extraction_type, css_selector, main_content_only,
+                url, force_fetcher or "stealthy", extraction_type, css_selector, main_content_only,
                 use_trafilatura, cache_ttl, offset, headless, real_chrome, wait,
                 proxy, timeout, network_idle, solve_cloudflare, block_webrtc,
                 hide_canvas, extra_headers, useragent, cookies, mc,
+                capture_xhr=capture_xhr, capture_pattern=capture_pattern,
+                fold_captured=fold_captured,
             )
 
         # 5. Reddit default: skip HTTP, go straight to stealthy. www.reddit.com
@@ -2517,6 +2728,7 @@ class MasterFetchServer:
             use_trafilatura, cache_ttl, offset, headless, real_chrome, wait,
             proxy, timeout, network_idle, solve_cloudflare, block_webrtc,
             hide_canvas, extra_headers, useragent, cookies, mc,
+            fold_captured=fold_captured,
         )
 
     async def _smart_fetch_bulk(
@@ -2575,7 +2787,8 @@ class MasterFetchServer:
         headless, real_chrome, wait, proxy, timeout, network_idle,
         solve_cloudflare, block_webrtc, hide_canvas, extra_headers,
         useragent, cookies, max_chars: int = MAX_CONTENT_CHARS,
-        page_action=None,
+        page_action=None, capture_xhr: bool = False,
+        capture_pattern: Optional[str] = None, fold_captured: bool = False,
     ) -> ResponseModel:
         """Execute a forced fetcher tier and finalize the result."""
         # HTTP fetcher takes seconds; browser timeout is ms. Cap at 30s.
@@ -2598,27 +2811,81 @@ class MasterFetchServer:
             # the one-off path where stealthy_fetch constructs the browser
             # with the requested proxy.
             ssid = None if proxy else await self._ensure_auto_session("stealthy")
+            # Interactions (page_action) depend on real layout: scroll thresholds
+            # and element visibility break when stylesheets are blocked, so the
+            # loaders that fire page 2+ never trigger. Keep resources for the
+            # interactive path; block them otherwise (faster, we strip them
+            # anyway).
             result = await self.stealthy_fetch(
                 url, extraction_type=extraction_type,
                 css_selector=css_selector, main_content_only=main_content_only,
                 use_trafilatura=use_trafilatura, headless=headless,
                 real_chrome=real_chrome, wait=wait, proxy=proxy,
                 timeout=timeout, network_idle=network_idle,
-                disable_resources=True,
+                disable_resources=(page_action is None),
                 solve_cloudflare=solve_cloudflare, block_webrtc=block_webrtc,
                 hide_canvas=hide_canvas, extra_headers=extra_headers,
                 useragent=useragent, cookies=cookies,
                 session_id=ssid,
                 page_action=page_action,
+                capture_xhr=capture_xhr, capture_pattern=capture_pattern,
             )
             result.escalation_path = "direct:stealthy"
+            if capture_xhr:
+                _apply_capture_verdict(result, fold_captured)
             return await self._finalize_result(result, url, extraction_type, css_selector, cache_ttl, offset, max_chars)
+
+    async def _capture_pass(
+        self, url, extraction_type, css_selector, main_content_only,
+        use_trafilatura, cache_ttl, offset, headless, real_chrome, wait,
+        proxy, timeout, network_idle, solve_cloudflare, block_webrtc,
+        hide_canvas, extra_headers, useragent, cookies, max_chars,
+        fold_captured: bool = False,
+    ) -> Optional[ResponseModel]:
+        """Re-fetch an AJAX shell through the browser, capturing its XHRs.
+
+        Returns a finalized result when the pass produced usable fragments, or
+        None when it did not (browser unavailable, crash, nothing captured) so
+        the caller can fall back to the HTTP-tier result it already has.
+        """
+        if not _browser_deps_available():
+            return None
+        try:
+            ssid = None if proxy else await self._ensure_auto_session("stealthy")
+            result = await self.stealthy_fetch(
+                url, extraction_type=extraction_type,
+                css_selector=css_selector, main_content_only=main_content_only,
+                use_trafilatura=use_trafilatura, headless=headless,
+                real_chrome=real_chrome, wait=wait, proxy=proxy,
+                timeout=timeout, network_idle=True,
+                disable_resources=True,
+                solve_cloudflare=solve_cloudflare, block_webrtc=block_webrtc,
+                hide_canvas=hide_canvas, extra_headers=extra_headers,
+                useragent=useragent, cookies=cookies, session_id=ssid,
+                capture_xhr=True,
+            )
+        except Exception as e:
+            logger.debug("XHR capture pass failed for %s: %s", url, e)
+            return None
+
+        if not (result.network or {}).get("fragments"):
+            return None
+
+        result.escalation_path = "http→stealthy(capture)"
+        _apply_capture_verdict(result, fold_captured, shell_detected=True)
+        # Shell results carry an error by design, which keeps them out of the
+        # cache — the next call re-runs the capture instead of serving
+        # boilerplate for the whole TTL.
+        return await self._finalize_result(
+            result, url, extraction_type, css_selector, cache_ttl, offset, max_chars,
+        )
 
     async def _auto_escalate(
         self, url, extraction_type, css_selector, main_content_only,
         use_trafilatura, cache_ttl, offset, headless, real_chrome, wait,
         proxy, timeout, network_idle, solve_cloudflare, block_webrtc,
         hide_canvas, extra_headers, useragent, cookies, max_chars: int = MAX_CONTENT_CHARS,
+        fold_captured: bool = False,
     ) -> ResponseModel:
         """Auto-escalation: try HTTP first, fall back to stealthy if it fails.
 
@@ -2653,7 +2920,24 @@ class MasterFetchServer:
             return await self._finalize_result(result, url, extraction_type, css_selector, cache_ttl, offset, max_chars)
 
         # Accept if status is OK and content is real (not a JS shell).
-        if result.status < 400 and not _is_js_shell(result):
+        # NOTE: status 0 = transport-level failure (DNS/TLS/reset/timeout),
+        # NOT success - `0 < 400` must never accept a network error.
+        if 200 <= result.status < 400 and not _is_js_shell(result):
+            # The HTTP tier "succeeded" but the page is a shell whose panels are
+            # filled over XHR: the text we have is boilerplate. Re-run through the
+            # browser capturing XHR so the data is recoverable. Only worth it when
+            # a browser is available; otherwise fall through with the honest error.
+            if _AJAX_SHELL.get():
+                captured_result = await self._capture_pass(
+                    url, extraction_type, css_selector, main_content_only,
+                    use_trafilatura, cache_ttl, offset, headless, real_chrome,
+                    wait, proxy, timeout, network_idle, solve_cloudflare,
+                    block_webrtc, hide_canvas, extra_headers, useragent,
+                    cookies, max_chars, fold_captured,
+                )
+                if captured_result is not None:
+                    return captured_result
+                result.error = result.error or (_AJAX_SHELL_ERROR + "; no data-bearing XHR was captured")
             result.escalation_path = "direct:http"
             return await self._finalize_result(result, url, extraction_type, css_selector, cache_ttl, offset, max_chars)
 
@@ -2662,11 +2946,16 @@ class MasterFetchServer:
         # 2. Status 403 or 503 -> explicit bot block / bot challenge
         # 3. Status 429 -> rate limited; stealthy has a different fingerprint
         # 4. Status 500/502 -> server error; may be intermittent or bot-related
+        # 5. Status 0 (transport failure: TLS fingerprint block, reset,
+        #    timeout) -> the browser's own network stack may succeed where
+        #    raw HTTP was blocked. EXCEPT deterministic failures a browser
+        #    cannot fix either (DNS, refused connection).
         # NOT for 401/407 (auth needed, not bot), 404/410 (page gone, stealthy
         # gets the same 404), 451 (legal block), 400 (bad request).
         should_escalate = (
-            (result.status < 400 and _is_js_shell(result))
+            (result.status < 400 and result.status > 0 and _is_js_shell(result))
             or result.status in (403, 429, 500, 502, 503)
+            or (result.status == 0 and not _is_deterministic_net_error(result))
         )
         if not should_escalate:
             result.duration_ms = elapsed
@@ -2685,25 +2974,60 @@ class MasterFetchServer:
 
         errors.append(f"HTTP failed (status {result.status})")
         remaining = max(timeout - int((now() - start_time) * 1000), 5000)
-        # Playwright fixes the proxy when the browser context starts. Do not
-        # route a proxied request through the shared direct auto-session.
-        ssid = None if proxy else await self._ensure_auto_session("stealthy")
-        result = await self.stealthy_fetch(
-            url, extraction_type=extraction_type,
-            css_selector=css_selector, main_content_only=main_content_only,
-            use_trafilatura=use_trafilatura, headless=headless,
-            real_chrome=real_chrome, wait=wait, proxy=proxy,
-            timeout=remaining, network_idle=network_idle,
-            disable_resources=True,
-            solve_cloudflare=solve_cloudflare, block_webrtc=block_webrtc,
-            hide_canvas=hide_canvas, extra_headers=extra_headers,
-            useragent=useragent, cookies=cookies,
-            session_id=ssid,
-        )
+        # If the HTTP tier already looked like an AJAX shell, capture during the
+        # escalation fetch we are about to make anyway rather than paying for a
+        # second browser round-trip afterwards.
+        http_flagged_shell = _AJAX_SHELL.get()
+        try:
+            # Playwright fixes the proxy when the browser context starts. Do not
+            # route a proxied request through the shared direct auto-session.
+            ssid = None if proxy else await self._ensure_auto_session("stealthy")
+            result = await self.stealthy_fetch(
+                url, extraction_type=extraction_type,
+                css_selector=css_selector, main_content_only=main_content_only,
+                use_trafilatura=use_trafilatura, headless=headless,
+                real_chrome=real_chrome, wait=wait, proxy=proxy,
+                timeout=remaining, network_idle=network_idle,
+                disable_resources=True,
+                solve_cloudflare=solve_cloudflare, block_webrtc=block_webrtc,
+                hide_canvas=hide_canvas, extra_headers=extra_headers,
+                useragent=useragent, cookies=cookies,
+                session_id=ssid,
+                capture_xhr=http_flagged_shell,
+            )
+        except Exception as e:
+            # A browser crash (session launch failure, patchright error)
+            # must surface as the structured all-tiers-failed envelope,
+            # not as a raw exception that loses the HTTP-tier context.
+            result = ResponseModel(
+                url=url, status=0, content=[],
+                fetcher_used="stealthy",
+                error=redact_api_key(str(e)[:200]),
+            )
         elapsed = (now() - start_time) * 1000
         result.duration_ms = elapsed
 
-        if result.status < 400 and not _is_js_shell(result):
+        if 200 <= result.status < 400 and not _is_js_shell(result):
+            # _AJAX_SHELL now reflects the rendered page: a browser render can
+            # still be a shell when the panels are filled by later XHRs.
+            rendered_shell = _AJAX_SHELL.get()
+            if (result.network or {}).get("fragments"):
+                result.escalation_path = "http→stealthy(capture)"
+                _apply_capture_verdict(
+                    result, fold_captured,
+                    shell_detected=rendered_shell or http_flagged_shell,
+                )
+                return await self._finalize_result(result, url, extraction_type, css_selector, cache_ttl, offset, max_chars)
+            if rendered_shell:
+                captured_result = await self._capture_pass(
+                    url, extraction_type, css_selector, main_content_only,
+                    use_trafilatura, cache_ttl, offset, headless, real_chrome,
+                    wait, proxy, timeout, network_idle, solve_cloudflare,
+                    block_webrtc, hide_canvas, extra_headers, useragent,
+                    cookies, max_chars, fold_captured,
+                )
+                if captured_result is not None:
+                    return captured_result
             result.escalation_path = "http→stealthy"
             return await self._finalize_result(result, url, extraction_type, css_selector, cache_ttl, offset, max_chars)
 
@@ -2884,7 +3208,7 @@ class MasterFetchServer:
     _TOOL_DEFS: list[dict] = [
         {
             "name": "mcp_smart_fetch",
-            "description": "Fetch any URL or PDF. Auto anti-bot (HTTP -> stealthy). Use after smart_search to get page content - search gives URLs + snippets, smart_fetch gives the full page. \n\nPOWER FEATURES (save calls + tokens): \n- focus='query': extracts only BM25-relevant paragraphs. smart_fetch(url, focus='embedding dimension') on a 75-page paper returns only paragraphs about embeddings - one call instead of ten. Post-cache (no re-fetch). Re-pass same focus when paginating. \n- pages='9' or pages='1-5,9-12': specific PDF pages. PDFs return table_of_contents [{level,title,page,end_page}] - use page ranges to grab one section. \n- urls=['url1','url2']: parallel bulk fetch. Use when you need full page content from multiple specific URLs - one call, not N sequential ones. \n\nDECISION GUIDE: Have a URL + a specific question? focus='your question'. Have a PDF + know which page? pages='9'. Have a PDF + don't know which page? focus='your question' (BM25 finds it). Content behind click/form/scroll? actions=[{click:'button'},{fill:{selector:'#q',text:'x'}}]. Need the page's source links? include_links=true -> response.links.citations. \n\nRESPONSE SIGNALS (check before trusting content): \n- content_ok: True = real content. False = JS shell, login wall, or error - don't trust the content. \n- next_action: follow it - tells you the optimal next call (paginate, switch source, follow links). Empty = done. \n- page_type: 'list' = page links to the real content (fetch those links or smart_crawl). 'auth_wall'/'paywall' = content behind login/payment (switch sources). \n- is_truncated + next_offset: more content available. Use offset=next_offset to continue, or re-fetch with focus= to get only relevant parts. \n- content_age_days + is_stale: for current-state questions, seek newer sources if stale. \n- quality_score: PDF extraction quality 0-1. Low = garbled/CID corruption. \n\ncss_selector narrows WHERE to extract (DOM element). focus narrows WHAT to extract (relevance to query). Use both for maximum precision. DataDome/Akamai/Turnstile unbypassable -> switch sources, don't retry same URL. cache_ttl=0 forces fresh.",
+            "description": "Fetch any URL or PDF. Auto anti-bot (HTTP -> stealthy). Use after smart_search to get page content - search gives URLs + snippets, smart_fetch gives the full page. \n\nPOWER FEATURES (save calls + tokens): \n- focus='query': extracts only BM25-relevant paragraphs. smart_fetch(url, focus='embedding dimension') on a 75-page paper returns only paragraphs about embeddings - one call instead of ten. Post-cache (no re-fetch). Re-pass same focus when paginating. \n- pages='9' or pages='1-5,9-12': specific PDF pages. PDFs return table_of_contents [{level,title,page,end_page}] - use page ranges to grab one section. \n- urls=['url1','url2']: parallel bulk fetch. Use when you need full page content from multiple specific URLs - one call, not N sequential ones. \n\nDECISION GUIDE: Have a URL + a specific question? focus='your question'. Have a PDF + know which page? pages='9'. Have a PDF + don't know which page? focus='your question' (BM25 finds it). Content behind click/form/scroll? actions=[{click:'button'},{fill:{selector:'#q',text:'x'}}]. Need the page's source links? include_links=true -> response.links.citations. \n\nRESPONSE SIGNALS (check before trusting content): \n- content_ok: True = real content. False = JS shell, login wall, or error - don't trust the content. \n- next_action: follow it - tells you the optimal next call (paginate, switch source, follow links). Empty = done. \n- page_type: 'list' = page links to the real content (fetch those links or smart_crawl). 'auth_wall'/'paywall' = content behind login/payment (switch sources). \n- network: present when the page loads its data over XHR (prices, forecasts, tables). content is then boilerplate and content_ok=False; read network.fragments (the is_primary one holds the data), or re-fetch with fold_captured=true to get it in content. \n- is_truncated + next_offset: more content available. Use offset=next_offset to continue, or re-fetch with focus= to get only relevant parts. \n- content_age_days + is_stale: for current-state questions, seek newer sources if stale. \n- quality_score: PDF extraction quality 0-1. Low = garbled/CID corruption. \n\ncss_selector narrows WHERE to extract (DOM element). focus narrows WHAT to extract (relevance to query). Use both for maximum precision. DataDome/Akamai/Turnstile unbypassable -> switch sources, don't retry same URL. cache_ttl=0 forces fresh.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -2900,8 +3224,8 @@ class MasterFetchServer:
                     "pages": {"type": "string", "description": "PDF only: page spec like '1-5' or '1,3,5-7'. Use table_of_contents page/end_page ranges to pick. None = all pages."},
                     "password": {"type": "string", "description": "PDF only: password for an encrypted PDF."},
                     "focus": {"type": "string", "description": "Query-focused extraction: only BM25-relevant blocks returned. Context saver on long pages. Post-cache (no re-fetch). Re-pass same focus when paginating."},
-                    "actions": {"type": "array", "items": {"type": "object", "additionalProperties": True}, "description": "Page interactions on stealthy browser AFTER load, BEFORE extraction. Forces stealthy + bypasses cache. Each item: {click:'css'}, {fill:{selector:'css',text:'x'}}, {press:'Enter'}, {wait:500}, {scroll:3}, {wait_selector:'css'}. Use for load-more, search forms, pagination, infinite scroll."},
-                    "options": {"type": "object", "description": "include_links (bool,false: response.links=citations/navigation/external+primary_source), include_media (bool,false: up to 20 page image URLs), proxy (str|dict), cookies (list), extra_headers (dict), useragent (str), wait (ms,0), network_idle (bool,SPAs), headless (bool,true), respect_robots (bool,false), real_chrome/solve_cloudflare/block_webrtc/hide_canvas/main_content_only/use_trafilatura (anti-detect tuning, good defaults, rarely needed).", "additionalProperties": True},
+                    "actions": {"type": "array", "items": {"type": "object", "additionalProperties": True}, "description": "Page interactions on stealthy browser AFTER load, BEFORE extraction. Forces stealthy + bypasses cache. Each item: {click:'css'}, {fill:{selector:'css',text:'x'}}, {press:'Enter'}, {wait:500}, {scroll:3}, {wait_selector:'css'}. Use for load-more, search forms, pagination, infinite scroll. Set options.capture_xhr=true to also collect the XHR responses these interactions fire (data that only loads on click/scroll)."},
+                    "options": {"type": "object", "description": "include_links (bool,false: response.links=citations/navigation/external+primary_source), include_media (bool,false: up to 20 page image URLs), capture_xhr (bool,false: capture the page's XHR responses into response.network - for pages whose data arrives over XHR; auto-enabled when an AJAX shell is detected), capture_pattern (str regex selecting which request URLs to capture), fold_captured (bool,false: merge the primary captured fragment into content instead of leaving it in network), proxy (str|dict), cookies (list), extra_headers (dict), useragent (str), wait (ms,0), network_idle (bool,SPAs), headless (bool,true), respect_robots (bool,false), real_chrome/solve_cloudflare/block_webrtc/hide_canvas/main_content_only/use_trafilatura (anti-detect tuning, good defaults, rarely needed).", "additionalProperties": True},
                 },
             },
             "annotations": {"readOnlyHint": True, "idempotentHint": True, "openWorldHint": True},
@@ -2965,60 +3289,92 @@ class MasterFetchServer:
         },
     ]
 
-    def serve(self, http: bool = False, host: str = "127.0.0.1", port: int = 8765):
-        """Start the MCP server using low-level Server for minimal token overhead.
+    def build_mcp_server(self):
+        """Construct the low-level MCP Server (mcp 2.x API).
 
-        When ``http`` is False (default) the server runs over stdio, which is what
-        Claude Code, Cursor, OpenCode, and other local MCP clients expect. When
-        True it exposes the **streamable HTTP** transport (MCP 2025-03-26 spec)
-        at ``http://host:port/mcp``, which is what Open WebUI (v0.6.31+) and
-        other HTTP MCP clients connect to directly, no proxy needed. The legacy
-        SSE transport was removed (deprecated in the spec)."""
-        from mcp.server import Server
-        from mcp.types import Tool, ToolAnnotations, ListToolsResult, CallToolResult, TextContent
+        Kept separate from serve() so tests can drive the real MCP layer
+        in-process (mcp Client(server)) instead of spawning stdio.
+        """
+        from mcp.server import Server, ServerRequestContext
+        from mcp.server import runner as _runner
+        from mcp.types import (
+            CallToolRequestParams,
+            CallToolResult,
+            LATEST_PROTOCOL_VERSION,
+            ListToolsResult,
+            PaginatedRequestParams,
+            TextContent,
+            Tool,
+        )
+        from mcp_types.methods import (
+            CLIENT_REQUESTS,
+            SPEC_CLIENT_METHODS,
+            validate_client_request as _orig_validate,
+        )
 
-        # MCP SDK 2.x: handlers are constructor params (on_list_tools / on_call_tool)
-        # instead of @server.list_tools() / @server.call_tool() decorators, and both
-        # take (ctx, params) and return fully-formed result objects. The old
-        # decorator API was removed in 2.x (it's what crashed the container with
-        # AttributeError: 'Server' object has no attribute 'list_tools').
+        # ── 2026-07-28 stateless spec conformance patches ────────────────
+        # The MCP SDK 2.1.1 runner still defaults to the legacy 2025-11-25
+        # version and enforces an `initialize` handshake gate. The 2026-07-28
+        # spec is stateless: no handshake, `server/discover` MUST be callable
+        # without initialization, and version-less requests should be served.
+        # These patches make hound a dual-era server: legacy clients that send
+        # `initialize` get the handshake path; modern clients get stateless.
 
-        def _build_tool(td: dict) -> Tool:
-            """Convert a v1-style tool definition dict to a v2 ``Tool``.
+        # 1. Allow server/discover (and all spec methods) without prior initialize.
+        _runner._INIT_EXEMPT = frozenset(SPEC_CLIENT_METHODS)
 
-            ``_TOOL_DEFS`` uses the legacy camelCase keys (``inputSchema``,
-            ``readOnlyHint``, ...); v2 renamed them to snake_case
-            (``input_schema``, ``read_only_hint``, ...).
-            """
-            kwargs = dict(td)
-            if "inputSchema" in kwargs:
-                kwargs["input_schema"] = kwargs.pop("inputSchema")
-            ann = kwargs.get("annotations")
-            if isinstance(ann, dict):
-                kwargs.pop("annotations")
-                _ann_key_map = {
-                    "title": "title",
-                    "readOnlyHint": "read_only_hint",
-                    "destructiveHint": "destructive_hint",
-                    "idempotentHint": "idempotent_hint",
-                    "openWorldHint": "open_world_hint",
-                }
-                kwargs["annotations"] = ToolAnnotations(
-                    **{_ann_key_map.get(k, k): v for k, v in ann.items()}
-                )
-            return Tool(**kwargs)
+        # 2. Fall back to LATEST_PROTOCOL_VERSION for methods that only exist
+        #    in the 2026-07-28 surface (e.g. server/discover). Without this,
+        #    validate_client_request("server/discover", "2025-11-25", params)
+        #    raises KeyError -> METHOD_NOT_FOUND.
+        if not getattr(_orig_validate, "_hound_patched", False):
+            from mcp_types.methods import serialize_server_result as _orig_serialize
 
-        async def _list_tools(ctx, params) -> ListToolsResult:
-            # Return hand-crafted minimal tool definitions.
-            return ListToolsResult(
-                tools=[_build_tool(td) for td in self._TOOL_DEFS]
-            )
+            def _patched_validate(method, version, params, **kw):
+                # The 2026-07-28 spec says a version-less request is served on
+                # the default. Inject _meta defaults when missing so validation
+                # passes for stateless clients that omit _meta entirely.
+                if params is not None and "_meta" not in (params or {}):
+                    params = {
+                        **(params or {}),
+                        "_meta": {
+                            "io.modelcontextprotocol/protocolVersion": LATEST_PROTOCOL_VERSION,
+                            "io.modelcontextprotocol/clientCapabilities": {},
+                        },
+                    }
+                try:
+                    return _orig_validate(method, version, params, **kw)
+                except KeyError:
+                    return _orig_validate(method, LATEST_PROTOCOL_VERSION, params, **kw)
+            _patched_validate._hound_patched = True
 
-        async def _call_tool(ctx, params) -> CallToolResult:
-            name = params.name
-            arguments = params.arguments or {}
+            def _patched_serialize(method, version, data, **kw):
+                try:
+                    return _orig_serialize(method, version, data, **kw)
+                except KeyError:
+                    return _orig_serialize(method, LATEST_PROTOCOL_VERSION, data, **kw)
+
+            import mcp_types.methods as _mt
+            _mt.validate_client_request = _patched_validate
+            _mt.serialize_server_result = _patched_serialize
+            _runner._methods = _mt
+
+        # ── list_tools: return hand-crafted minimal definitions ──────
+        async def handle_list_tools(
+            ctx: ServerRequestContext, params: PaginatedRequestParams | None,
+        ) -> ListToolsResult:
+            return ListToolsResult(tools=[Tool(**td) for td in self._TOOL_DEFS])
+
+        # ── call_tool: dispatch to existing methods ─────────────────
+        # v2 contract: handlers return full result types and exceptions do
+        # NOT become is_error results (they become protocol errors, which
+        # most clients raise instead of showing the LLM). Every tool error
+        # the agent should see is caught here and returned as is_error=True.
+        async def handle_call_tool(
+            ctx: ServerRequestContext, params: CallToolRequestParams,
+        ) -> CallToolResult:
             try:
-                result = await self._dispatch(name, arguments)
+                result = await self._dispatch(params.name, params.arguments or {})
                 # _dispatch returns (content_list, structured_dict) or just content_list
                 if isinstance(result, tuple):
                     content_list, structured = result
@@ -3031,16 +3387,25 @@ class MasterFetchServer:
                     is_error=True,
                 )
 
-        server = Server(
+        return Server(
             "Hound",
             version=__version__,
-            # Connect-time orientation: clients inject this into the agent context
-            # once on initialize (the MCP `instructions` field).
             instructions=HOUND_INSTRUCTIONS,
-            website_url="https://github.com/dondai1234/master-fetch",
-            on_list_tools=_list_tools,
-            on_call_tool=_call_tool,
+            website_url="https://github.com/dondai44423/master-fetch",
+            on_list_tools=handle_list_tools,
+            on_call_tool=handle_call_tool,
         )
+
+    def serve(self, http: bool = False, host: str = "127.0.0.1", port: int = 8765):
+        """Start the MCP server using low-level Server for minimal token overhead.
+
+        When ``http`` is False (default) the server runs over stdio, which is what
+        Claude Code, Cursor, OpenCode, and other local MCP clients expect. When
+        True it exposes the **streamable HTTP** transport (MCP 2025-03-26 spec)
+        at ``http://host:port/mcp``, which is what Open WebUI (v0.6.31+) and
+        other HTTP MCP clients connect to directly, no proxy needed. The legacy
+        SSE transport was removed (deprecated in the spec)."""
+        server = self.build_mcp_server()
 
         if not http:
             import anyio
@@ -3086,22 +3451,74 @@ class MasterFetchServer:
             # Streamable HTTP transport (MCP 2025-03-26 spec). This is the
             # transport Open WebUI (v0.6.31+) and other modern HTTP MCP clients
             # connect to directly, no mcpo proxy needed. Endpoint: http://host:port/mcp
+            from contextlib import asynccontextmanager
+            from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
+            from starlette.applications import Starlette
+            from starlette.routing import Route
             import uvicorn
 
-            # MCP SDK 2.x: `streamable_http_app()` builds a complete streamable-HTTP
-            # ASGI app (session manager + its lifespan, the /mcp route, DNS-rebinding
-            # protection for localhost). Run it directly as the uvicorn app — wrapping
-            # it in an outer Starlette/Route caused HTTP 405 in this SDK.
-            #
-            # Note: we intentionally use the blocking `uvicorn.run()` here instead of
-            # driving `uvicorn.Server.serve()` from our own asyncio loop: the SDK's
-            # streamable-HTTP session-manager lifespan did not serve requests when
-            # awaited inside a coexisting loop, whereas running it directly is stable.
-            # The prewarm/teardown hooks that the v1 HTTP bundle used are therefore not
-            # run here; the stealthy browser is still auto-managed (launched on demand
-            # and closed by the idle monitor), so server stability is unaffected.
-            app = server.streamable_http_app(streamable_http_path="/mcp", host=host)
+            manager = StreamableHTTPSessionManager(app=server)
+
+            class _StreamableHTTPASGIApp:
+                async def __call__(self, scope, receive, send):
+                    # ?stateless=true query param: skip MCP session tracking.
+                    # The upstream MCP SDK's StreamableHTTPSessionManager
+                    # exposes stateless=True but the lifecycle binds a single
+                    # instance, so we create a per-request stateless manager
+                    # here. Default stateful behavior is unchanged when the
+                    # query param is absent or any other value.
+                    query = scope.get("query_string", b"").decode("latin-1")
+                    params = {kv.split("=", 1)[0]: (kv.split("=", 1)[1] if "=" in kv else "") for kv in query.split("&") if kv}
+                    if params.get("stateless", "").lower() == "true":
+                        stateless_manager = StreamableHTTPSessionManager(app=server, stateless=True)
+                        async with stateless_manager.run():
+                            await stateless_manager.handle_request(scope, receive, send)
+                        return
+                    await manager.handle_request(scope, receive, send)
+
+            @asynccontextmanager
+            async def lifespan(app):
+                warm = asyncio.create_task(self._prewarm_stealthy())
+                warm_reranker = asyncio.create_task(
+                    _safe_imported_prewarm("master_fetch.reranker", "prewarm_reranker")
+                )
+                try:
+                    async with manager.run():
+                        yield
+                finally:
+                    for _t in (warm, warm_reranker):
+                        try:
+                            _t.cancel()
+                        except BaseException:
+                            pass
+                    for _t in (warm, warm_reranker):
+                        try:
+                            await _t
+                        except BaseException:
+                            pass
+                    try:
+                        await self._shutdown_close_sessions()
+                    except BaseException:
+                        pass
+
+            app = Starlette(routes=[Route("/mcp", endpoint=_StreamableHTTPASGIApp())], lifespan=lifespan)
             uvicorn.run(app, host=host, port=port)
+
+    @staticmethod
+    def _collect(args: dict, options: dict, keys: tuple[str, ...]) -> dict:
+        """Collect kwargs for a tool from promoted top-level args + the
+        `options` bag. Top-level wins; explicit nulls (clients often
+        serialize omitted optional fields as null) are dropped so the
+        method's declared defaults apply instead of None leaking through
+        the binding layer and crashing the handler."""
+        out: dict = {}
+        for k in keys:
+            v = args.get(k)
+            if v is None:
+                v = options.get(k)
+            if v is not None:
+                out[k] = v
+        return out
 
     async def _dispatch(self, name: str, args: dict) -> list | tuple:
         """Route MCP tool calls to internal methods and format responses.
@@ -3112,75 +3529,72 @@ class MasterFetchServer:
         """
         from mcp.types import TextContent, ImageContent
 
-        options = args.get("options") or {}
+        if not isinstance(args, dict):
+            raise ValueError("Tool arguments must be a JSON object")
+        options = args.get("options")
+        if not isinstance(options, dict):
+            options = {}
 
         if name == "mcp_smart_fetch":
             url = args.get("url", "")
             urls = args.get("urls")
             if not url and not urls:
                 raise ValueError("Either 'url' or 'urls' must be provided")
-            # Promoted first-class params: top-level takes precedence over the
-            # options bag (backward compat: options still accepted as fallback).
-            css_selector = args.get("css_selector") if args.get("css_selector") is not None else options.get("css_selector")
-            max_content_chars = args.get("max_content_chars") if args.get("max_content_chars") is not None else options.get("max_content_chars")
-            timeout = args.get("timeout") if args.get("timeout") is not None else options.get("timeout")
-            pages = args.get("pages") if args.get("pages") is not None else options.get("pages")
-            password = args.get("password") if args.get("password") is not None else options.get("password")
-            focus = args.get("focus") if args.get("focus") is not None else options.get("focus")
-            actions = args.get("actions") if args.get("actions") is not None else options.get("actions")
-            kw = {k: v for k, v in options.items() if k in (
-                "proxy", "cookies", "extra_headers", "useragent",
-                "wait", "network_idle", "headless", "real_chrome", "respect_robots",
-                "main_content_only", "use_trafilatura", "solve_cloudflare", "block_webrtc", "hide_canvas",
-                "include_media", "include_links",
-            )}
-            result = await self.smart_fetch(
-                url=url, urls=urls,
-                extraction_type=args.get("extraction_type", "markdown"),
-                css_selector=css_selector,
-                max_content_chars=max_content_chars,
-                timeout=timeout if timeout is not None else 30000,
-                pages=pages,
-                password=password,
-                focus=focus,
-                actions=actions,
-                cache_ttl=args.get("cache_ttl", DEFAULT_TTL),
-                force_fetcher=args.get("force_fetcher"),
-                offset=args.get("offset", 0), **kw,
-            )
+            kw = self._collect(args, options, (
+                "css_selector", "max_content_chars", "timeout", "pages",
+                "password", "focus", "actions", "extraction_type",
+                "cache_ttl", "offset", "proxy", "cookies", "extra_headers",
+                "useragent", "wait", "network_idle", "headless", "real_chrome",
+                "respect_robots", "main_content_only", "use_trafilatura",
+                "solve_cloudflare", "block_webrtc", "hide_canvas",
+                "include_media", "include_links", "force_fetcher",
+                "capture_xhr", "capture_pattern", "fold_captured",
+            ))
+            result = await self.smart_fetch(url=url, urls=urls, **kw)
             return [TextContent(type="text", text=result.model_dump_json())], result.model_dump()
 
         elif name == "mcp_smart_crawl":
-            kw = {k: v for k, v in options.items() if k in (
+            url = args.get("url")
+            if not url:
+                raise ValueError("'url' must be provided")
+            kw = self._collect(args, options, (
+                "discover_only", "focus", "crawl_urls",
                 "max_pages", "max_depth", "path_include", "path_exclude",
                 "max_content_chars_per", "max_total_chars", "concurrency",
                 "cache_ttl", "respect_robots", "force_fetcher", "timeout",
                 "deadline_ms", "sitemap",
-            )}
-            result = await self.smart_crawl(
-                url=args["url"], discover_only=args.get("discover_only", False),
-                focus=args.get("focus"), crawl_urls=args.get("crawl_urls"), **kw,
-            )
+            ))
+            result = await self.smart_crawl(url=url, **kw)
             return [TextContent(type="text", text=result.model_dump_json())], result.model_dump()
 
         elif name == "mcp_screenshot":
-            kw = {k: v for k, v in options.items() if k in (
-                "full_page", "image_type", "quality", "wait", "wait_selector", "network_idle", "timeout",
-            )}
-            result = await self.screenshot(url=args["url"], session_id=args.get("session_id"), **kw)
+            url = args.get("url")
+            if not url:
+                raise ValueError("'url' must be provided")
+            kw = self._collect(args, options, (
+                "session_id", "full_page", "image_type", "quality", "wait",
+                "wait_selector", "network_idle", "timeout",
+            ))
+            result = await self.screenshot(url=url, **kw)
             return result  # already list[ImageContent|TextContent]
 
         elif name == "mcp_smart_search":
-            kw = {k: v for k, v in options.items() if k in (
+            query = args.get("query")
+            if not query:
+                raise ValueError("'query' must be provided")
+            # Optional args that are absent or null fall back to their
+            # declared defaults (mode='auto', max_results=6, ...) - never
+            # pass None through the binding layer.
+            kw = self._collect(args, options, (
                 "max_results", "cache_ttl", "mode", "engines", "url",
-                "site", "exclude_sites", "location", "language", "region", "page",
-                "freshness",
-            )}
-            result = await self.smart_search(query=args["query"], **kw)
+                "site", "exclude_sites", "location", "language", "region",
+                "page", "freshness",
+            ))
+            result = await self.smart_search(query=query, **kw)
             return [TextContent(type="text", text=result.model_dump_json())], result.model_dump()
 
         elif name == "cache_clear":
-            result = await self.cache_clear(all=args.get("all", False))
+            result = await self.cache_clear(all=bool(args.get("all", False)))
             return [TextContent(type="text", text=result.model_dump_json())], result.model_dump()
 
         elif name == "version":
@@ -3205,7 +3619,7 @@ def _help_epilog() -> str:
         f"  {ui.cyan('hound --doctor')}     {ui.dim('health check + fix advice')}",
         f"  {ui.cyan('hound --rollback')}   {ui.dim('undo the last update')}",
         "",
-        ui.dim("docs:") + "  " + ui.cyan("https://github.com/dondai1234/master-fetch"),
+        ui.dim("docs:") + "  " + ui.cyan("https://github.com/dondai44423/master-fetch"),
     ])
 
 

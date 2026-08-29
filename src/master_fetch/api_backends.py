@@ -232,7 +232,7 @@ class GitHubSearchEngine(BaseAPIEngine):
         super().__init__(proxy=proxy, timeout=timeout, verify=verify)
         # GitHub API requires a User-Agent header.
         self.http_client._client.headers.update({
-            "User-Agent": "hound-mcp/12.0 (https://github.com/dondai1234/master-fetch)",
+            "User-Agent": "hound-mcp/12.0 (https://github.com/dondai44423/master-fetch)",
             "Accept": "application/vnd.github+json",
         })
 

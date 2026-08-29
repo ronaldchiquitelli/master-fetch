@@ -353,3 +353,35 @@ class TestAPIKeyRedaction:
     def test_preserves_non_sensitive_text(self):
         text = "Error connecting to https://example.com/api"
         assert redact_api_key(text) == text
+
+
+# ─── SSRF: DNS-blind vector regression tests ──────────────────────────────
+
+class TestSSRFDnsResolution:
+    """validate_url must resolve hostnames and reject any that resolve to
+    private/internal IPs. Before the fix, validate_url only checked literal
+    IP addresses — a hostname like localtest.me (which resolves to 127.0.0.1)
+    passed validation and could be used to reach internal services."""
+
+    def test_hostname_resolving_to_loopback_is_blocked(self):
+        """localtest.me resolves to 127.0.0.1 — must be rejected."""
+        from master_fetch.security import SecurityError
+        with pytest.raises(SecurityError, match="resolves to internal"):
+            validate_url("http://localtest.me/latest/meta-data/")
+
+    def test_hostname_resolving_to_loopback_ipv6_is_blocked(self):
+        """localtest.me also has an AAAA record for ::1 — must be rejected."""
+        from master_fetch.security import SecurityError, _resolve_host_ips
+        ips = _resolve_host_ips("localtest.me")
+        assert any("::1" in ip or "127.0." in ip for ip in ips), \
+            f"expected loopback in {ips}"
+
+    def test_public_hostname_still_accepted(self):
+        """example.com resolves to a public IP — must still pass."""
+        result = validate_url("https://example.com/")
+        assert result == "https://example.com/"
+
+    def test_allow_internal_bypasses_dns_check(self):
+        """When allow_internal=True, DNS resolution check is skipped."""
+        result = validate_url("http://localtest.me/", allow_internal=True)
+        assert result == "http://localtest.me/"

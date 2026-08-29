@@ -180,7 +180,9 @@ class TestFollowRedirectsCoercion:
 
     @pytest.mark.asyncio
     async def test_string_safe_coerced_to_true(self):
-        # scrapling-style "safe" -> True
+        # scrapling-style "safe" -> True (manual redirect following enabled)
+        # primp always gets follow_redirects=False; the get() method follows
+        # redirects manually with SSRF re-validation per hop.
         session = HTTPSession()
         session._client = MagicMock()
         mock_resp = MagicMock()
@@ -193,9 +195,9 @@ class TestFollowRedirectsCoercion:
         session._client.get = MagicMock(return_value=mock_resp)
 
         await session.get("https://example.com", follow_redirects="safe")
-        # The actual call should pass follow_redirects=True
+        # primp always gets follow_redirects=False (we follow manually)
         call_kwargs = session._client.get.call_args
-        assert call_kwargs.kwargs.get("follow_redirects") is True
+        assert call_kwargs.kwargs.get("follow_redirects") is False
 
     @pytest.mark.asyncio
     async def test_string_never_coerced_to_false(self):
@@ -230,3 +232,150 @@ class TestFollowRedirectsCoercion:
         await session.get("https://example.com", follow_redirects=False)
         call_kwargs = session._client.get.call_args
         assert call_kwargs.kwargs.get("follow_redirects") is False
+
+
+# ─── SSRF: redirect re-validation regression tests ────────────────────────
+
+class TestSSRFRedirectRevalidation:
+    """The fetcher must re-validate every redirect hop through validate_url.
+    Before the fix, primp followed redirects internally without ever calling
+    validate_url on the target, so a public URL that 302-redirects to
+    127.0.0.1 bypassed the SSRF guard entirely."""
+
+    @pytest.mark.asyncio
+    async def test_redirect_to_loopback_is_blocked(self):
+        """A 302 from a public URL to http://127.0.0.1/ must raise SecurityError."""
+        from master_fetch.security import SecurityError
+
+        session = HTTPSession()
+        session._client = MagicMock()
+
+        # First response: 302 redirect from public URL to 127.0.0.1
+        redirect_resp = MagicMock()
+        redirect_resp.status_code = 302
+        redirect_resp.headers = {"location": "http://127.0.0.1:9941/"}
+        redirect_resp.content = b""
+        redirect_resp.url = "https://example.com/"
+        redirect_resp.reason = "Found"
+        redirect_resp.cookies = []
+
+        session._client.get = MagicMock(return_value=redirect_resp)
+
+        with pytest.raises(SecurityError, match="internal/private IP"):
+            await session.get("https://example.com/", follow_redirects=True)
+
+    @pytest.mark.asyncio
+    async def test_redirect_to_public_url_is_followed(self):
+        """A 302 from a public URL to another public URL must be followed."""
+        session = HTTPSession()
+        session._client = MagicMock()
+
+        redirect_resp = MagicMock()
+        redirect_resp.status_code = 302
+        redirect_resp.headers = {"location": "https://example.org/page"}
+        redirect_resp.content = b""
+        redirect_resp.url = "https://example.com/"
+        redirect_resp.reason = "Found"
+        redirect_resp.cookies = []
+
+        final_resp = MagicMock()
+        final_resp.status_code = 200
+        final_resp.headers = {"content-type": "text/html"}
+        final_resp.content = b"<html>content</html>"
+        final_resp.url = "https://example.org/page"
+        final_resp.reason = "OK"
+        final_resp.cookies = []
+
+        session._client.get = MagicMock(side_effect=[redirect_resp, final_resp])
+
+        result = await session.get("https://example.com/", follow_redirects=True)
+        assert result.status == 200
+        assert "content" in result.content
+
+    @pytest.mark.asyncio
+    async def test_primp_always_gets_follow_redirects_false(self):
+        """primp must never follow redirects internally — we handle it manually."""
+        session = HTTPSession()
+        session._client = MagicMock()
+
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.headers = {"content-type": "text/html"}
+        mock_resp.content = b"ok"
+        mock_resp.url = "https://example.com/"
+        mock_resp.reason = "OK"
+        mock_resp.cookies = []
+
+        session._client.get = MagicMock(return_value=mock_resp)
+        await session.get("https://example.com/", follow_redirects=True)
+
+        call_kwargs = session._client.get.call_args
+        assert call_kwargs.kwargs.get("follow_redirects") is False
+
+    @pytest.mark.asyncio
+    async def test_never_redirects_does_not_follow(self):
+        """When follow_redirects='never', a 302 response is returned as-is."""
+        session = HTTPSession()
+        session._client = MagicMock()
+
+        redirect_resp = MagicMock()
+        redirect_resp.status_code = 302
+        redirect_resp.headers = {"location": "http://127.0.0.1/"}
+        redirect_resp.content = b""
+        redirect_resp.url = "https://example.com/"
+        redirect_resp.reason = "Found"
+        redirect_resp.cookies = []
+
+        session._client.get = MagicMock(return_value=redirect_resp)
+
+        result = await session.get("https://example.com/", follow_redirects="never")
+        assert result.status == 302
+
+    @pytest.mark.asyncio
+    async def test_redirect_chain_each_hop_validated(self):
+        """A redirect chain A -> B -> 127.0.0.1 must be caught at the third hop."""
+        from master_fetch.security import SecurityError
+
+        session = HTTPSession()
+        session._client = MagicMock()
+
+        resp_a = MagicMock()
+        resp_a.status_code = 302
+        resp_a.headers = {"location": "https://example.org/step2"}
+        resp_a.content = b""
+        resp_a.url = "https://example.com/"
+        resp_a.reason = "Found"
+        resp_a.cookies = []
+
+        resp_b = MagicMock()
+        resp_b.status_code = 302
+        resp_b.headers = {"location": "http://127.0.0.1/"}
+        resp_b.content = b""
+        resp_b.url = "https://example.org/step2"
+        resp_b.reason = "Found"
+        resp_b.cookies = []
+
+        session._client.get = MagicMock(side_effect=[resp_a, resp_b])
+
+        with pytest.raises(SecurityError, match="internal/private IP"):
+            await session.get("https://example.com/", follow_redirects=True)
+
+    @pytest.mark.asyncio
+    async def test_max_redirects_cap_enforced(self):
+        """Redirect loop must stop at max_redirects, not loop forever."""
+        session = HTTPSession()
+        session._client = MagicMock()
+
+        loop_resp = MagicMock()
+        loop_resp.status_code = 302
+        loop_resp.headers = {"location": "https://example.org/loop"}
+        loop_resp.content = b""
+        loop_resp.url = "https://example.com/"
+        loop_resp.reason = "Found"
+        loop_resp.cookies = []
+
+        session._client.get = MagicMock(return_value=loop_resp)
+        result = await session.get("https://example.com/", follow_redirects=True, max_redirects=3)
+        # Should stop after 3 redirects (still 302, didn't loop forever)
+        assert session._client.get.call_count == 4  # initial + 3 hops
+        assert result.status == 302

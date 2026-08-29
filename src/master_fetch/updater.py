@@ -339,12 +339,9 @@ def _heal_cmd(target: str) -> list[str]:
 
 def _pip_cmd_full(target: str) -> list[str]:
     """Full reinstall: force-reinstall hound-mcp[all] at the pinned version
-    with --no-deps. The --force-reinstall triggers pip to install the [all]
-    extras (rapidocr, onnxruntime, tokenizers) even when hound-mcp itself is
-    already at the target version. The --no-deps prevents pip from
-    force-reinstalling transitive deps (which can break version compatibility,
-    e.g. pydantic vs pydantic-core)."""
-    return [sys.executable, "-m", "pip", "install", "--force-reinstall", "--no-deps",
+    and its dependencies. This intentionally lets pip repair missing or broken
+    core dependencies and [all] extras (rapidocr, onnxruntime, tokenizers)."""
+    return [sys.executable, "-m", "pip", "install", "--force-reinstall",
             f"hound-mcp[all]=={target}", "--quiet", "--disable-pip-version-check",
             "--no-python-version-warning"]
 
@@ -379,8 +376,8 @@ def _build_helper_source(target: str, repair_path: str, parent_pid: int, full: b
     so it runs even if the package is mid-replacement or bricked.
 
     The helper: waits for the parent launcher to exit, stages the launcher aside
-    (rename trick; stops a server only if it holds a stale .old), runs pip
-    --no-deps, self-heals on verify-fail, prints a clean result. Plain ASCII
+    (rename trick; stops a server only if it holds a stale .old), runs pip,
+    self-heals on verify-fail, prints a clean result. Plain ASCII
     output (no ANSI) since it runs detached after the parent's color setup is
     gone and may run on a legacy console.
     """
@@ -504,13 +501,13 @@ if servers_before:
 _stage()
 
 if FULL:
-    rc, stderr = _pip("--force-reinstall", "--no-deps", "hound-mcp[all]==" + TARGET)
+    rc, stderr = _pip("--force-reinstall", "hound-mcp[all]==" + TARGET)
 else:
     rc, stderr = _pip("hound-mcp==" + TARGET)
 if not _advanced(_ver()):
     print("  first pass did not complete - recovering...")
     if FULL:
-        rc2, stderr2 = _pip("--force-reinstall", "--no-deps", "hound-mcp[all]==" + TARGET)
+        rc2, stderr2 = _pip("--force-reinstall", "hound-mcp[all]==" + TARGET)
     else:
         rc2, stderr2 = _pip("--force-reinstall", "hound-mcp==" + TARGET)
     if not _advanced(_ver()):
@@ -541,7 +538,7 @@ if servers_before:
 def _spawn_helper(target: str, repair_path: str, parent_pid: int, full: bool = False) -> bool:
     """Spawn the detached Windows helper (inherits this console). Returns True
     if spawned. `full=True` triggers a complete reinstall with deps + [all]
-    extras instead of the usual --no-deps update."""
+    extras instead of the usual core-only update."""
     import subprocess
     src = _build_helper_source(target, repair_path, parent_pid, full)
     try:

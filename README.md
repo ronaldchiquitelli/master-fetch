@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="https://raw.githubusercontent.com/dondai1234/master-fetch/master/docs/hound-logo.png" alt="Hound logo" width="128">
+<img src="https://raw.githubusercontent.com/dondai44423/master-fetch/master/docs/hound-logo.png" alt="Hound logo" width="128">
 
 # 🐕 Hound
 
@@ -12,9 +12,11 @@ One MCP server · one warm browser · zero accounts · runs on your machine
 [![PyPI](https://img.shields.io/pypi/v/hound-mcp.svg?label=pypi)](https://pypi.org/project/hound-mcp/)
 [![Python](https://img.shields.io/pypi/pyversions/hound-mcp.svg)](https://pypi.org/project/hound-mcp/)
 [![License: MIT](https://img.shields.io/pypi/l/hound-mcp.svg)](LICENSE)
-[![CI](https://img.shields.io/github/actions/workflow/status/dondai1234/master-fetch/ci.yml?label=CI)](https://github.com/dondai1234/master-fetch/actions/workflows/ci.yml)
+[![CI](https://img.shields.io/github/actions/workflow/status/dondai44423/master-fetch/ci.yml?label=CI)](https://github.com/dondai44423/master-fetch/actions/workflows/ci.yml)
 [![Downloads](https://static.pepy.tech/badge/hound-mcp)](https://pepy.tech/project/hound-mcp)
-[![GitHub stars](https://img.shields.io/github/stars/dondai1234/master-fetch?style=social)](https://github.com/dondai1234/master-fetch/stargazers)
+[![GitHub stars](https://img.shields.io/github/stars/dondai44423/master-fetch?style=social)](https://github.com/dondai44423/master-fetch/stargazers)
+
+[![ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/G5Y624N5RE)
 
 ```bash
 pip install hound-mcp[all] && playwright install chromium
@@ -27,7 +29,7 @@ pip install hound-mcp[all] && playwright install chromium
 <br>
 
 <div align="center">
-<img src="https://raw.githubusercontent.com/dondai1234/master-fetch/master/docs/hound-hero.png" alt="Hound gives your AI agent the web" width="860">
+<img src="https://raw.githubusercontent.com/dondai44423/master-fetch/master/docs/hound-hero.png" alt="Hound gives your AI agent the web" width="860">
 </div>
 
 ---
@@ -60,6 +62,9 @@ Same prompt, three tools. Hound does the whole thing on its own, search + fetch 
 - 🔒 **Reliability fixes**: universal error detection (error pages no longer look like success), dead Internet Archive fallback removed, self-healing CLI + stale process cleanup, CSS selector errors propagate instead of silently returning `[]`, browser startup failure cleans partial sessions, `hound --rollback` works for pinned older versions, `focus` and `actions` now forwarded from MCP dispatcher to `smart_fetch`.
 - 🐳 **Docker support**: multi-stage Dockerfile, docker-compose with shm_size 1gb, non-root user, healthcheck. By @imonlinux.
 - 🧪 **673 tests**.
+
+ NOTE!: The Hound Replacement is out: https://github.com/dondai44423/donsetch, if you use hound right now, i suggest you switch to donsetch, its better, the first stable version is out, its new, so maybe there are some hidden issues i didnt fix, but the main stuff works as of now.
+
 
 
 ---
@@ -107,7 +112,7 @@ Hound can run in Docker with HTTP mode, ideal for:
 ### Quick start with Docker Compose
 
 ```bash
-git clone https://github.com/dondai1234/master-fetch.git
+git clone https://github.com/dondai44423/master-fetch.git
 cd master-fetch
 docker-compose up -d
 ```
@@ -159,7 +164,7 @@ http://<your-host-ip>:8765/mcp
 ## 🔎 Local keyless search
 
 <div align="center">
-<img src="https://raw.githubusercontent.com/dondai1234/master-fetch/master/docs/hound-scene.png" alt="Hound fetches the web and brings it back to your agent" width="820">
+<img src="https://raw.githubusercontent.com/dondai44423/master-fetch/master/docs/hound-scene.png" alt="Hound fetches the web and brings it back to your agent" width="820">
 </div>
 
 No API key, no account, no third-party service. `smart_search` runs **10 keyless backends in parallel** on your machine, merges, dedups, and ranks. It returns URLs + ranking, **not page content**: the agent `smart_fetch`es whichever results match what it needs (the ranking is a hint, not a directive).
@@ -593,8 +598,8 @@ Most MCP servers cost 3–5K tokens just to exist. Hound's 6 tools cost **~2.7K 
 
 ### If Hound saves you time, ⭐ the repo: it helps others find it.
 
-[![GitHub stars](https://img.shields.io/github/stars/dondai1234/master-fetch?style=social)](https://github.com/dondai1234/master-fetch/stargazers)
+[![GitHub stars](https://img.shields.io/github/stars/dondai44423/master-fetch?style=social)](https://github.com/dondai44423/master-fetch/stargazers)
 
-**MIT** · [Changelog](CHANGELOG.md) · [Issues](https://github.com/dondai1234/master-fetch/issues) · [PyPI](https://pypi.org/project/hound-mcp/)
+**MIT** · [Changelog](CHANGELOG.md) · [Issues](https://github.com/dondai44423/master-fetch/issues) · [PyPI](https://pypi.org/project/hound-mcp/)
 
 </div>

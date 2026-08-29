@@ -46,10 +46,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # ── Install Hound from source ────────────────────────────────────────────────
+# Dependencies are pinned via constraints.txt (generated from a known-good
+# resolution of '.[all]') so a fresh build never resolves to an incompatible
+# new release of a transitive dep (e.g. the mcp 2.0 major bump on 2026-07-28).
 WORKDIR /build
-COPY pyproject.toml README.md LICENSE ./
+COPY pyproject.toml README.md LICENSE constraints.txt ./
 COPY src/ ./src/
-RUN pip install ".[all]"
+RUN pip install -c constraints.txt ".[all]"
 
 # ── Browsers + their system libraries ────────────────────────────────────────
 # `--with-deps` pulls in the Chromium shared-library stack (fonts, X11 stubs,

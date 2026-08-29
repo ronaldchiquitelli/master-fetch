@@ -505,3 +505,149 @@ class TestSearchProxyValidation:
         finally:
             m._TEXT_ENGINES.clear()
             m._TEXT_ENGINES.update(original)
+
+
+# ─── find_similar BYOK failover ──────────────────────────────────────────────
+
+class TestFindSimilarBYOKFailover:
+
+    @staticmethod
+    def _stub_find_similar_dependencies(monkeypatch):
+        import master_fetch.search_api_keys as api_keys
+
+        async def fake_fetch_source(url, *, timeout):
+            return "Source topic", "Source text with enough words to derive a query."
+
+        async def fake_ensure_reranker():
+            return None
+
+        monkeypatch.setattr(api_keys, "get_byok_engines", lambda: {"serper": object, "tavily": object})
+        monkeypatch.setattr(search, "fetch_source_for_similar", fake_fetch_source)
+        monkeypatch.setattr(search, "ensure_reranker", fake_ensure_reranker)
+        monkeypatch.setattr(search, "get_reranker", lambda: None)
+        monkeypatch.setattr(search, "_intent_backends", lambda intent: [])
+
+    @pytest.mark.asyncio
+    async def test_retries_next_byok_provider_before_keyless_fallback(self, monkeypatch):
+        self._stub_find_similar_dependencies(monkeypatch)
+        calls = []
+
+        async def fake_multi_search(query, max_results, **kwargs):
+            calls.append(kwargs["engines"])
+            if kwargs["engines"] == ["serper"]:
+                return [], [EngineReport(name="serper", blocked=True)]
+            return [RawResult(
+                title="Fallback provider result",
+                url="https://candidate.example/result",
+                snippet="similar source topic",
+                source="tavily",
+                position=1,
+            )], [EngineReport(name="tavily", ok=True)]
+
+        monkeypatch.setattr(search, "multi_search", fake_multi_search)
+
+        response = await search.smart_search(
+            None, "ignored", mode="find_similar", url="https://source.example/article", cache_ttl=0,
+        )
+
+        assert calls == [["serper"], ["tavily"]]
+        assert response.engines_used == ["tavily"]
+        assert [result.title for result in response.results] == ["Fallback provider result"]
+
+    @pytest.mark.asyncio
+    async def test_falls_back_to_keyless_engines_after_all_byok_providers_fail(self, monkeypatch):
+        self._stub_find_similar_dependencies(monkeypatch)
+        calls = []
+
+        async def fake_multi_search(query, max_results, **kwargs):
+            selected_engines = kwargs["engines"]
+            calls.append(selected_engines)
+            if selected_engines != list(DEFAULT_ENGINES):
+                return [], [EngineReport(name=selected_engines[0], blocked=True)]
+            return [RawResult(
+                title="Keyless fallback result",
+                url="https://candidate.example/keyless-result",
+                snippet="similar source topic",
+                source="brave",
+                position=1,
+            )], [EngineReport(name="brave", ok=True)]
+
+        monkeypatch.setattr(search, "multi_search", fake_multi_search)
+
+        response = await search.smart_search(
+            None, "ignored", mode="find_similar", url="https://source.example/article", cache_ttl=0,
+        )
+
+        assert calls == [["serper"], ["tavily"], list(DEFAULT_ENGINES)]
+        assert response.engines_used == ["brave"]
+        assert [result.title for result in response.results] == ["Keyless fallback result"]
+
+
+# ─── Google redirect URL unwrapping (percent-decoding fix) ────────────────
+
+class TestGoogleRedirectUnwrap:
+    """Google's /url?q= redirect wrapper must be percent-decoded.
+
+    Before the fix, a hand-rolled split extracted the q value but never
+    decoded it, so a target with its own query string (``?id=42``) came
+    back with ``%3Fid%3D42`` as literal path characters — a URL that 404s.
+    """
+
+    @pytest.fixture
+    def engine(self):
+        from master_fetch.search_metasearch import Google
+        return Google()
+
+    def _r(self, href, title="Some Title"):
+        """Minimal result object matching the metasearch interface."""
+        from types import SimpleNamespace
+        return SimpleNamespace(href=href, title=title)
+
+    def test_target_with_query_string(self, engine):
+        """The core bug: q value has its own %3F and %3D that must decode."""
+        r = self._r("/url?q=https://news.site/story%3Fid%3D42&sa=U")
+        out = engine.post_extract_results([r])
+        assert len(out) == 1
+        assert out[0].href == "https://news.site/story?id=42"
+
+    def test_target_with_query_string_utm(self, engine):
+        """utm_source / utm_medium params survive correctly."""
+        r = self._r("/url?q=https://shop.site/p%3Futm_source%3Dgoogle&sa=U")
+        out = engine.post_extract_results([r])
+        assert out[0].href == "https://shop.site/p?utm_source=google"
+
+    def test_target_no_query_string(self, engine):
+        """Targets without a query string are unaffected."""
+        r = self._r("/url?q=https://example.com/page&sa=U")
+        out = engine.post_extract_results([r])
+        assert out[0].href == "https://example.com/page"
+
+    def test_non_ascii_path(self, engine):
+        """Percent-encoded non-ASCII path characters decode correctly."""
+        r = self._r("/url?q=https://example.com/%E6%97%A5%E6%9C%AC&sa=U")
+        out = engine.post_extract_results([r])
+        assert out[0].href == "https://example.com/日本"
+
+    def test_q_not_first_parameter(self, engine):
+        """parse_qs finds q regardless of parameter order."""
+        r = self._r("/url?sa=U&q=https://example.com/page&ved=0")
+        out = engine.post_extract_results([r])
+        assert out[0].href == "https://example.com/page"
+
+    def test_absolute_href_passthrough(self, engine):
+        """Already-absolute hrefs pass through untouched."""
+        r = self._r("https://example.com/direct")
+        out = engine.post_extract_results([r])
+        assert out[0].href == "https://example.com/direct"
+
+    def test_empty_q_dropped(self, engine):
+        """A /url? with no q returns href unchanged, then fails the http filter."""
+        r = self._r("/url?sa=U&ved=0")
+        out = engine.post_extract_results([r])
+        assert len(out) == 0  # "/url?sa=U&ved=0" doesn't start with "http"
+
+    def test_untitled_dropped(self, engine):
+        """Results with no title are dropped (existing filter, previously uncovered)."""
+        r = self._r("/url?q=https://example.com/page", title="")
+        out = engine.post_extract_results([r])
+        assert len(out) == 0

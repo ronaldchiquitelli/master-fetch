@@ -186,6 +186,53 @@ def _create_route_handler(
     return handler
 
 
+# ─── XHR capture ─────────────────────────────────────────────────────────────
+
+async def _capture_response(
+    resp: Any,
+    captured: List[Dict[str, Any]],
+    captured_bytes: List[int],
+    pattern: Optional[Any] = None,
+) -> None:
+    """Buffer an XHR/fetch body if it looks like a data fragment.
+
+    Runs inside the page's response event, so it must never raise: a failure
+    here would otherwise surface as a fetch failure. Bodies are read eagerly
+    because they are unavailable once the page closes.
+    """
+    from master_fetch.network_capture import (
+        MAX_FRAGMENT_BYTES, MAX_TOTAL_BYTES, should_capture,
+    )
+    try:
+        if len(captured) >= 64 or captured_bytes[0] >= MAX_TOTAL_BYTES:
+            return
+        request = resp.request
+        if resp.status >= 400:
+            return
+        try:
+            headers = await resp.header_values("content-type")
+            content_type = headers[0] if headers else ""
+        except Exception:
+            content_type = ""
+        if not should_capture(resp.url, request.resource_type, content_type, pattern):
+            return
+        body = await resp.body()
+        if not body or len(body) > MAX_FRAGMENT_BYTES:
+            return
+        captured_bytes[0] += len(body)
+        captured.append({
+            "url": resp.url,
+            "status": resp.status,
+            "content_type": content_type,
+            "size_bytes": len(body),
+            "_body": body.decode("utf-8", errors="replace"),
+        })
+    except Exception:
+        # Response already discarded, redirect with no body, navigation
+        # aborted mid-flight — all expected, none worth failing the fetch.
+        pass
+
+
 # ─── Cloudflare solver ───────────────────────────────────────────────────────
 
 async def _get_page_content(page: Any, max_retries: int = 20) -> str:
@@ -218,7 +265,7 @@ def _detect_cloudflare(page_content: str) -> Optional[str]:
     return None
 
 
-async def _solve_cloudflare(page: Any) -> None:
+async def _solve_cloudflare(page: Any, _depth: int = 0) -> None:
     """Solve Cloudflare Turnstile/Interstitial challenge on a Playwright page.
 
     Ported from scrapling's StealthySessionMixin._cloudflare_solver.
@@ -230,7 +277,8 @@ async def _solve_cloudflare(page: Any) -> None:
     3. For non-interactive: waits for the "Just a moment" page to clear
     4. For interactive/embedded: clicks the Turnstile checkbox at the
        right coordinates (calculated from the iframe bounding box)
-    5. Waits for the challenge to resolve, retries if needed
+    5. Waits for the challenge to resolve, retries if needed (max 3
+       attempts - an unsolvable challenge must not recurse forever)
     """
     # Wait for network to settle
     try:
@@ -355,9 +403,12 @@ async def _solve_cloudflare(page: Any) -> None:
         logger.info("Cloudflare challenge solved")
         return
 
-    # Not solved: retry
+    # Not solved: retry (bounded - an unsolvable challenge gives up)
+    if _depth >= 2:
+        logger.info("Cloudflare challenge unsolved after 3 attempts, giving up")
+        return
     logger.info("Cloudflare challenge still present, retrying...")
-    await _solve_cloudflare(page)
+    await _solve_cloudflare(page, _depth + 1)
 
 
 # ─── Channel detection: prefer system Chrome over bundled Chromium ───────────────
@@ -395,8 +446,12 @@ def _detect_chrome_channel() -> str:
                 logger.info("System Chrome detected: %s", path)
                 return "chrome"
     else:
-        # POSIX: check if google-chrome or chromium is in PATH
-        for name in ("google-chrome", "google-chrome-stable", "chromium", "chromium-browser"):
+        # POSIX: only REAL Google Chrome qualifies for channel='chrome'.
+        # patchright resolves channel='chrome' to /opt/google/chrome/chrome
+        # only - a system Chromium (chromium/chromium-browser in PATH) is
+        # NOT Chrome, and selecting 'chrome' on a chromium-only machine
+        # broke the entire stealthy tier at launch.
+        for name in ("google-chrome", "google-chrome-stable"):
             if shutil.which(name):
                 _chrome_channel_cache = "chrome"
                 logger.info("System Chrome detected: %s", name)
@@ -486,6 +541,7 @@ def _get_chrome_ua() -> Optional[str]:
 
 _FINGERPRINT_PROFILES: List[Dict[str, Any]] = [
     {
+        "ua_os": "windows",
         "platform": "Win32",
         "languages": ["en-US", "en"],
         "hardware_concurrency": 8,
@@ -501,6 +557,7 @@ _FINGERPRINT_PROFILES: List[Dict[str, Any]] = [
         ],
     },
     {
+        "ua_os": "windows",
         "platform": "Win32",
         "languages": ["en-US", "en"],
         "hardware_concurrency": 12,
@@ -516,6 +573,7 @@ _FINGERPRINT_PROFILES: List[Dict[str, Any]] = [
         ],
     },
     {
+        "ua_os": "windows",
         "platform": "Win32",
         "languages": ["en-US", "en"],
         "hardware_concurrency": 8,
@@ -531,6 +589,7 @@ _FINGERPRINT_PROFILES: List[Dict[str, Any]] = [
         ],
     },
     {
+        "ua_os": "mac",
         "platform": "MacIntel",
         "languages": ["en-US", "en"],
         "hardware_concurrency": 8,
@@ -545,11 +604,54 @@ _FINGERPRINT_PROFILES: List[Dict[str, Any]] = [
             {"name": "WebKit built-in PDF", "filename": "internal-pdf-viewer", "description": "Portable Document Format"},
         ],
     },
+    {
+        "ua_os": "linux",
+        "platform": "Linux x86_64",
+        "languages": ["en-US", "en"],
+        "hardware_concurrency": 8,
+        "device_memory": 8,
+        "webgl_vendor": "Google Inc. (Intel)",
+        "webgl_renderer": "ANGLE (Intel, Mesa Intel(R) UHD Graphics (CML GT2), OpenGL 4.6)",
+        "plugins": [
+            {"name": "PDF Viewer", "filename": "internal-pdf-viewer", "description": "Portable Document Format"},
+            {"name": "Chrome PDF Viewer", "filename": "internal-pdf-viewer", "description": "Portable Document Format"},
+            {"name": "Chromium PDF Viewer", "filename": "internal-pdf-viewer", "description": "Portable Document Format"},
+            {"name": "Microsoft Edge PDF Viewer", "filename": "internal-pdf-viewer", "description": "Portable Document Format"},
+            {"name": "WebKit built-in PDF", "filename": "internal-pdf-viewer", "description": "Portable Document Format"},
+        ],
+    },
 ]
 
 
-def _generate_fingerprint_profile() -> Dict[str, Any]:
+def _os_from_ua(ua: Optional[str]) -> Optional[str]:
+    """Map a User-Agent string to a profile OS key."""
+    if not ua:
+        return None
+    ua_l = ua.lower()
+    if "windows nt" in ua_l:
+        return "windows"
+    if "macintosh" in ua_l or "mac os x" in ua_l:
+        return "mac"
+    if "x11" in ua_l or "linux" in ua_l:
+        return "linux"
+    return None
+
+
+def _host_os_key() -> str:
+    """The host's OS as a profile key (fallback when no UA override)."""
+    if sys.platform == "win32":
+        return "windows"
+    if sys.platform == "darwin":
+        return "mac"
+    return "linux"
+
+
+def _generate_fingerprint_profile(preferred_os: Optional[str] = None) -> Dict[str, Any]:
     """Pick a random coherent fingerprint profile.
+
+    When preferred_os is given (parsed from the UA that will be sent),
+    only profiles for that OS are considered - a Windows UA with a
+    MacIntel navigator.platform is an instant WAF contradiction.
 
     Returns a dict with platform, languages, hardware_concurrency,
     device_memory, webgl_vendor, webgl_renderer, plugins. All values
@@ -557,7 +659,12 @@ def _generate_fingerprint_profile() -> Dict[str, Any]:
     WebGL renderer).
     """
     import random
-    return random.choice(_FINGERPRINT_PROFILES).copy()
+    pool = _FINGERPRINT_PROFILES
+    if preferred_os:
+        matches = [p for p in pool if p.get("ua_os") == preferred_os]
+        if matches:
+            pool = matches
+    return random.choice(pool).copy()
 
 
 def _build_stealth_init_script(profile: Dict[str, Any], full: bool = True) -> str:
@@ -988,6 +1095,15 @@ class BrowserSession:
                 except Exception:
                     pass
 
+        # Pick the fingerprint profile coherently with the UA being sent:
+        # a Windows UA with a MacIntel navigator.platform is an instant
+        # WAF contradiction. Chosen BEFORE launch so the init script
+        # (built post-launch) uses the same profile.
+        if self._is_stealthy:
+            self._fingerprint_profile = _generate_fingerprint_profile(
+                _os_from_ua(context_options.get("user_agent")) or _host_os_key()
+            )
+
         # Merge additional args (highest priority)
         context_options.update(self._additional_args)
 
@@ -1001,9 +1117,26 @@ class BrowserSession:
                 # Use persistent context (temp dir)
                 self._user_data_dir = tempfile.mkdtemp(prefix="hound_browser_")
                 persistent_opts = {**browser_options, **context_options, "user_data_dir": self._user_data_dir}
-                self._context = await self._playwright.chromium.launch_persistent_context(
-                    **persistent_opts
-                )
+                try:
+                    self._context = await self._playwright.chromium.launch_persistent_context(
+                        **persistent_opts
+                    )
+                except Exception:
+                    # channel='chrome' resolves to real Google Chrome only.
+                    # On machines without it (chromium-only Linux, or a
+                    # broken Chrome install) the launch fails - fall back
+                    # to patchright's bundled Chromium instead of dying.
+                    if persistent_opts.get("channel") == "chrome":
+                        logger.warning(
+                            "System Chrome launch failed; "
+                            "falling back to bundled Chromium")
+                        persistent_opts["channel"] = "chromium"
+                        browser_options["channel"] = "chromium"
+                        self._context = await self._playwright.chromium.launch_persistent_context(
+                            **persistent_opts
+                        )
+                    else:
+                        raise
 
             # Initialize context
             if self._cookies:
@@ -1015,7 +1148,9 @@ class BrowserSession:
             # which uses Routes and breaks DNS resolution with patchright).
             self._init_script: Optional[str] = None
             if self._is_stealthy:
-                self._fingerprint_profile = _generate_fingerprint_profile()
+                # Profile chosen pre-launch, coherent with the sent UA.
+                if self._fingerprint_profile is None:
+                    self._fingerprint_profile = _generate_fingerprint_profile(_host_os_key())
                 # Full patches only for bundled Chromium; system Chrome already
                 # has correct WebGL, plugins, platform, window.chrome.
                 is_chrome_channel = browser_options["channel"] == "chrome"
@@ -1103,6 +1238,8 @@ class BrowserSession:
         page_action: Optional[Callable] = None,
         page_setup: Optional[Callable] = None,
         retries: Optional[int] = None,
+        capture_xhr: bool = False,
+        capture_pattern: Optional[str] = None,
         **kwargs: Any,
     ) -> "Any":
         """Navigate to a URL and return a Response object.
@@ -1127,10 +1264,23 @@ class BrowserSession:
         actual_wait_selector = wait_selector if wait_selector is not None else self._wait_selector
         actual_wait_selector_state = wait_selector_state or self._wait_selector_state
         actual_network_idle = network_idle if network_idle is not None else self._network_idle
+        # Capture is pointless if we tear the page down before its XHRs land,
+        # so waiting for network idle is mandatory when capturing.
+        if capture_xhr:
+            actual_network_idle = True
         actual_solve_cf = solve_cloudflare if solve_cloudflare is not None else self._solve_cloudflare
         actual_page_action = page_action or self._page_action
         actual_page_setup = page_setup or self._page_setup
         actual_retries = retries if retries is not None else self._retries
+
+        # An explicit capture_pattern narrows capture to URLs the caller
+        # already knows it wants; a bad regex must not kill the fetch.
+        capture_re = None
+        if capture_xhr and capture_pattern:
+            try:
+                capture_re = re.compile(capture_pattern)
+            except re.error as e:
+                raise ValueError(f"invalid capture_pattern regex: {e}") from e
 
         # Build referer
         request_headers = {}
@@ -1162,6 +1312,10 @@ class BrowserSession:
 
                 # Response capture
                 final_response: List[Any] = [None]
+                # XHR bodies for AJAX-shell pages (capture_xhr). Bodies must be
+                # read while the page is open — after page.close() they are gone.
+                captured: List[Dict[str, Any]] = []
+                captured_bytes = [0]
                 async def _handle_response(resp: Any) -> None:
                     try:
                         if (resp.request.resource_type == "document"
@@ -1170,6 +1324,9 @@ class BrowserSession:
                             final_response[0] = resp
                     except Exception:
                         pass
+                    if capture_xhr:
+                        await _capture_response(resp, captured, captured_bytes,
+                                                capture_re)
                 page.on("response", _handle_response)
 
                 # Page setup callback
@@ -1220,6 +1377,11 @@ class BrowserSession:
                             await result
                     except Exception as e:
                         logger.warning(f"page_action callback error: {e}")
+                    # Interactions (click/scroll/tab-switch) commonly kick off
+                    # XHRs. When capturing, settle for those to land before the
+                    # page is torn down, or the fragments they carry are lost.
+                    if capture_xhr:
+                        await self._wait_for_stability(page, True)
 
                 # Wait for selector
                 if actual_wait_selector:
@@ -1246,7 +1408,7 @@ class BrowserSession:
                 # Build response
                 from master_fetch.fetcher import response_from_browser_page
                 response = await response_from_browser_page(
-                    page, first_response, final_response[0]
+                    page, first_response, final_response[0], captured=captured
                 )
 
                 # Memory cleanup: trigger Chrome's internal GC + cache drop

@@ -74,6 +74,56 @@ class TestFocusContent:
         assert "Focus:" in result
         assert "'apple'" in result
 
+    def test_matching_heading_keeps_lexically_unmatched_section_content(self):
+        """A matching heading retains its otherwise-unmatched section at any threshold."""
+        text = """# Overview
+
+General introduction.
+
+## Rate Limit Recovery
+
+Wait briefly before retrying the request.
+
+## Other Topic
+
+This sibling section must not be included.
+
+# Appendix
+
+Unrelated appendix text.
+
+# Credits
+
+Names and acknowledgements."""
+
+        result = focus_content(text, "rate limit", threshold=10, fallback_top=1)
+
+        assert "Rate Limit Recovery" in result
+        assert "Wait briefly before retrying" in result
+
+    def test_heading_relevance_does_not_cross_into_sibling_section(self):
+        """A matching heading's inherited relevance ends at the next sibling."""
+        text = """## Rate Limit Recovery
+
+Wait briefly before retrying the request.
+
+## Other Topic
+
+This sibling section must not be included.
+
+# Appendix
+
+Unrelated appendix text.
+
+# Credits
+
+Names and acknowledgements."""
+
+        result = focus_content(text, "rate limit", fallback_top=1)
+
+        assert "Wait briefly before retrying" in result
+        assert "This sibling section must not be included" not in result
+
 
 class TestSplitBlocks:
 

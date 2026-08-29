@@ -550,7 +550,7 @@ async def smart_crawl(
                 start_url=start_norm, pages=[], pages_crawled=0,
                 pages_discovered=0, discover_only=True, sitemap_used=False,
                 duration_ms=(time() - t0) * 1000,
-                summary=f"no sitemap.xml found at {root} (robots.txt had no Sitemap directive and /sitemap.xml returned nothing)",
+                summary=f"no sitemap.xml found at {_same_root(url)} (robots.txt had no Sitemap directive and /sitemap.xml returned nothing)",
                 next_action=("No sitemap found. Re-run smart_crawl with sitemap=false (or omit it) "
                              "to use best-first BFS discovery instead."),
             )

@@ -8,7 +8,7 @@ token in copy/links/scripts) must not classify as paywall; real paywalls
 """
 
 import pytest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from master_fetch.envelope import (
     detect_page_type, classify_source, compute_freshness, page_type_from_error,
     _paywall_evidence, _parse_date, _count_content_links,
@@ -185,7 +185,7 @@ class TestPaywallEvidence:
 class TestClassifySource:
 
     def test_github_is_official(self):
-        st, off = classify_source("https://github.com/dondai1234/master-fetch")
+        st, off = classify_source("https://github.com/dondai44423/master-fetch")
         assert st == "github" and off is True
 
     def test_github_raw_is_official(self):
@@ -283,9 +283,15 @@ class TestFreshness:
         assert age == 21
 
     def test_no_fetched_at_falls_back_to_today(self):
-        meta = {"published_time": "2026-07-20T00:00:00Z"}
+        # An empty fetched_at falls back to today, so the age is measured from
+        # now. Anchor published_time relative to today rather than a fixed date
+        # (a hardcoded date makes this pass only within N days of when it was
+        # written, then rots into a spurious failure).
+        published = datetime.now(timezone.utc) - timedelta(days=5)
+        meta = {"published_time": published.strftime("%Y-%m-%dT%H:%M:%SZ")}
         age, stale = compute_freshness(meta, "")
-        assert 0 <= age <= 10
+        assert 4 <= age <= 6
+        assert stale is False
 
 
 # ─── page_type_from_error ─────────────────────────────────────────

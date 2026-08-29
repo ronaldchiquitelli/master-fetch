@@ -1,6 +1,6 @@
 [project]
 name = "hound-mcp"
-version = "12.4.1"
+version = "13.2.0"
 description = "Web research for AI agents. Fetch any page with anti-bot bypass plus web search. $0 forever. No scrapling dependency: hound uses primp + patchright directly. Graceful degradation when browser deps are unavailable (HTTP-only mode on Termux/Android). Token-optimized tool definitions, polished cross-platform CLI, brick-proof self-update with hound doctor + rollback."
 readme = "README.md"
 authors = [{name = "Bishesh Bhandari", email = "bishesh@master-fetch.dev"}]
@@ -12,14 +12,10 @@ dependencies = [
     # When browser deps are missing, hound runs in HTTP-only mode
     # (see _scrapling_available + _fallback_http_get in server.py).
     # Core deps:
-    # MCP SDK 2.x: server.py uses the modern constructor API
-    # (Server(on_list_tools=..., on_call_tool=...), streamable_http_app()),
-    # which was introduced in 2.x. The legacy decorator API
-    # (@server.list_tools / @server.call_tool) that 2.x removed used to crash the
-    # container at boot with AttributeError: 'Server' object has no attribute
-    # 'list_tools', so keep >=2.1.1 to stay on the migrated 2.x line.
-    "mcp>=2.1.1",
-    "pydantic>=2.0",
+    # mcp 2.x (2026-07-28 spec): the lowlevel Server API was reworked
+    # (on_* constructor handlers, snake_case fields); 1.x is incompatible.
+    "mcp>=2.1.1,<3",  # 2.1.1+ has server/discover handler for 2026-07-28 spec
+    "pydantic>=2.12",
     "trafilatura>=2.0.0",
     "aiosqlite>=0.20.0",
     # metasearch backends (vendored ddgs engine layer, MIT) - keyless search:
@@ -69,9 +65,9 @@ all = [
 ]
 
 [project.urls]
-Repository = "https://github.com/dondai1234/master-fetch"
-Issues = "https://github.com/dondai1234/master-fetch/issues"
-Changelog = "https://github.com/dondai1234/master-fetch/blob/master/CHANGELOG.md"
+Repository = "https://github.com/dondai44423/master-fetch"
+Issues = "https://github.com/dondai44423/master-fetch/issues"
+Changelog = "https://github.com/dondai44423/master-fetch/blob/master/CHANGELOG.md"
 
 [project.scripts]
 hound = "master_fetch.cli:main"

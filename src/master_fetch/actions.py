@@ -124,13 +124,19 @@ def build_page_action(actions) -> Optional[Callable]:
                 elif "wait" in a:
                     await page.wait_for_timeout(a["wait"])
                 elif "scroll" in a:
+                    # Jump to the current bottom each step, not a fixed viewport
+                    # delta. Infinite-scroll loaders fire near the bottom and
+                    # grow the page; a fixed scrollBy stops re-reaching the new
+                    # bottom once content extends past it, so page 2+ never load.
+                    # scrollTo(scrollHeight) re-triggers on every step and still
+                    # reveals lazy-loaded content progressively.
                     for _ in range(a["scroll"]):
                         try:
                             await page.evaluate(
-                                "() => window.scrollBy(0, window.innerHeight || 800)"
+                                "() => window.scrollTo(0, document.body.scrollHeight)"
                             )
                         except Exception:
-                            await page.mouse.wheel(0, 800)
+                            await page.mouse.wheel(0, 20000)
                         await page.wait_for_timeout(700)
                 elif "wait_selector" in a:
                     await page.locator(a["wait_selector"]).first.wait_for(

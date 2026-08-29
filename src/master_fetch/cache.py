@@ -97,6 +97,31 @@ async def _ensure_db(cache_dir: Path | None = None) -> Path:
         return db_path
 
 
+class _BusyConn:
+    """Async CM wrapper that applies PRAGMA busy_timeout on entry."""
+
+    def __init__(self, conn):
+        self._conn = conn
+
+    async def __aenter__(self):
+        db = await self._conn.__aenter__()
+        await db.execute("PRAGMA busy_timeout=5000")
+        return db
+
+    async def __aexit__(self, *exc):
+        return await self._conn.__aexit__(*exc)
+
+
+def _connect(db_path: Path) -> _BusyConn:
+    """Open a cache DB connection with a busy timeout.
+
+    journal_mode=WAL persists in the DB file, but busy_timeout is
+    PER-CONNECTION - without it, concurrent bulk-fetch writers hit
+    'database is locked' instantly instead of waiting up to 5s.
+    """
+    return _BusyConn(aiosqlite.connect(db_path))
+
+
 async def get_cached(
     url: str,
     extraction_type: str,
@@ -114,7 +139,7 @@ async def get_cached(
     key = _cache_key(url, extraction_type, css_selector, pages, source)
     db_path = await _ensure_db(cache_dir)
 
-    async with aiosqlite.connect(db_path) as db:
+    async with _connect(db_path) as db:
         db.row_factory = aiosqlite.Row
         # Use MIN(stored_ttl, requested_ttl) so caller can request fresher data
         cursor = await db.execute(
@@ -161,7 +186,7 @@ async def set_cached(
     db_path = await _ensure_db(cache_dir)
     env_json = json.dumps(envelope) if envelope else "{}"
 
-    async with aiosqlite.connect(db_path) as db:
+    async with _connect(db_path) as db:
         await db.execute(
             """INSERT OR REPLACE INTO cache
                (key, url, extraction_type, content, status, fetched_at, ttl,
@@ -188,7 +213,7 @@ async def set_cached(
 async def clear_cache(cache_dir: Path | None = None) -> int:
     """Clear all expired entries. Returns count of purged rows."""
     db_path = await _ensure_db(cache_dir)
-    async with aiosqlite.connect(db_path) as db:
+    async with _connect(db_path) as db:
         cursor = await db.execute(
             "DELETE FROM cache WHERE fetched_at + ttl <= ?", (time.time(),)
         )
@@ -199,7 +224,7 @@ async def clear_cache(cache_dir: Path | None = None) -> int:
 async def clear_all_cache(cache_dir: Path | None = None) -> int:
     """Nuke the entire cache. Returns count of purged rows."""
     db_path = await _ensure_db(cache_dir)
-    async with aiosqlite.connect(db_path) as db:
+    async with _connect(db_path) as db:
         cursor = await db.execute("DELETE FROM cache")
         await db.commit()
         return cursor.rowcount

@@ -10,7 +10,7 @@ import sys
 import pytest
 from unittest.mock import patch, MagicMock
 from master_fetch.cli import main, _run_repair
-from master_fetch.updater import check_version, pad_version, _at_or_ahead, _advanced, _build_helper_source, do_update, rollback
+from master_fetch.updater import check_version, pad_version, _at_or_ahead, _advanced, _build_helper_source, _pip_cmd_full, do_update, rollback
 
 
 # ─── CLI self-heal structure ───────────────────────────────────────
@@ -109,6 +109,25 @@ class TestVersionComparison:
 
     def test_malformed_installed(self):
         assert _at_or_ahead("not-a-version", "11.1.6") is False
+
+
+# ─── Full reinstall dependency repair ──────────────────────────────
+
+class TestReinstall:
+    def test_full_reinstall_command_repairs_core_and_extra_dependencies(self):
+        """--reinstall must let pip resolve both core and [all] dependencies."""
+        command = _pip_cmd_full("12.4.1")
+
+        assert "--force-reinstall" in command
+        assert "hound-mcp[all]==12.4.1" in command
+        assert "--no-deps" not in command
+
+    def test_windows_full_reinstall_repairs_core_and_extra_dependencies(self):
+        """The detached Windows helper must use the same dependency-aware install."""
+        source = _build_helper_source("12.4.1", "repair.py", 1234, full=True)
+
+        assert '"hound-mcp[all]==" + TARGET' in source
+        assert "--no-deps" not in source
 
 
 class TestRollback:

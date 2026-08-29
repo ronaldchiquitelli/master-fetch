@@ -175,3 +175,19 @@ class TestCacheEviction:
         # Check newest entry is still there
         new = await get_cached("https://example.com/24", "markdown", cache_dir=cache_dir)
         assert new is not None
+
+
+@pytest.mark.asyncio
+async def test_concurrent_writers_no_database_locked(tmp_path):
+    """20 parallel writers must not hit 'database is locked' -
+    every connection gets PRAGMA busy_timeout=5000."""
+    from master_fetch.cache import set_cached
+    import asyncio
+
+    async def write(i):
+        await set_cached(
+            f"https://example.com/p{i}", "markdown", [f"content {i}"],
+            200, None, 3600, cache_dir=tmp_path,
+        )
+
+    await asyncio.gather(*[write(i) for i in range(20)])

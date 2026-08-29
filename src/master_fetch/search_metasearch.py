@@ -475,11 +475,21 @@ class Google(BaseSearchEngine):
             payload["tbs"] = f"qdr:{timelimit}"
         return payload
 
+    def _google_extract_url(self, href: str) -> str:
+        """Unwrap Google's ``/url?q=...`` redirect wrapper.
+
+        ``parse_qs`` percent-decodes the value, unlike a hand-rolled split
+        which left ``%3F`` and ``%3D`` literally in the URL (so any target
+        with its own query string 404'd).  Mirrors ``_yahoo_extract_url``.
+        """
+        target = parse_qs(urlparse(href).query).get("q", [""])[0]
+        return target or href
+
     def post_extract_results(self, results: list[Any]) -> list[Any]:
         out = []
         for r in results:
-            if r.href.startswith("/url?q="):
-                r.href = r.href.split("?q=")[1].split("&")[0]
+            if r.href.startswith("/url?"):
+                r.href = self._google_extract_url(r.href)
             if r.title and r.href.startswith("http"):
                 out.append(r)
         return out

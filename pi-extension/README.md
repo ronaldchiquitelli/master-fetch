@@ -22,7 +22,7 @@ pi install npm:@houndmcp/hound-mcp-pi
 Alternatively, install from git (pins to a specific tag):
 
 ```bash
-pi install git:github.com/dondai1234/master-fetch@v10.3.0
+pi install git:github.com/dondai44423/master-fetch@v10.3.0
 ```
 
 That's it. The extension auto-discovers `hound` on your PATH, spawns it as a singleton subprocess, and prewarms it at session start. No API key, no account, no config file.

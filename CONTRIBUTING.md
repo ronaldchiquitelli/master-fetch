@@ -22,7 +22,7 @@ Bug report and feature request templates are available when you open a new issue
 ## Development
 
 ```bash
-git clone https://github.com/dondai1234/master-fetch.git
+git clone https://github.com/dondai44423/master-fetch.git
 cd master-fetch
 pip install -e .[all,dev]
 playwright install chromium

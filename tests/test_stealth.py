@@ -59,8 +59,8 @@ class TestSessionProxy:
 
 class TestFingerprintProfiles:
 
-    def test_has_four_profiles(self):
-        assert len(_FINGERPRINT_PROFILES) == 4
+    def test_has_five_profiles(self):
+        assert len(_FINGERPRINT_PROFILES) == 5
 
     def test_all_profiles_have_required_fields(self):
         required = {"platform", "languages", "hardware_concurrency",
@@ -185,3 +185,75 @@ class TestInitScript:
         script = _build_stealth_init_script(_FINGERPRINT_PROFILES[0], full=True)
         assert script.count("{") == script.count("}")
         assert script.count("(") == script.count(")")
+
+
+class TestChromeChannelDetection:
+
+    def test_chromium_only_machine_does_not_select_chrome_channel(self, monkeypatch):
+        import master_fetch.browser as b
+        monkeypatch.setattr(b, "_chrome_channel_cache", None)
+        monkeypatch.setattr("shutil.which",
+                            lambda n: "/usr/bin/chromium" if n == "chromium" else None)
+        assert b._detect_chrome_channel() == "chromium"
+
+    def test_real_google_chrome_selects_chrome_channel(self, monkeypatch):
+        import master_fetch.browser as b
+        monkeypatch.setattr(b, "_chrome_channel_cache", None)
+        monkeypatch.setattr("shutil.which",
+                            lambda n: "/usr/bin/google-chrome" if n == "google-chrome" else None)
+        assert b._detect_chrome_channel() == "chrome"
+
+    @pytest.mark.asyncio
+    async def test_failed_chrome_launch_falls_back_to_bundled(self, monkeypatch):
+        """A broken system Chrome must not kill the stealthy tier."""
+        import master_fetch.browser as b
+        monkeypatch.setattr(b, "_chrome_channel_cache", "chrome")
+
+        calls = []
+
+        class FakeChromium:
+            async def launch_persistent_context(self, **opts):
+                calls.append(opts.get("channel"))
+                if opts.get("channel") == "chrome":
+                    raise RuntimeError("Executable doesn't exist at /opt/google/chrome/chrome")
+                return object()
+
+        class FakePlaywright:
+            chromium = FakeChromium()
+
+        class FakePlaywrightCtx:
+            async def start(self):
+                return FakePlaywright()
+
+        from patchright import async_api
+        monkeypatch.setattr(async_api, "async_playwright", lambda: FakePlaywrightCtx())
+
+        session = b.StealthyBrowser()
+        monkeypatch.setattr(b, "_get_chrome_ua", lambda: None)
+        await session.start()
+        assert calls == ["chrome", "chromium"]
+        assert session._is_alive
+        await session.close()
+
+
+class TestFingerprintCoherence:
+
+    def test_linux_profile_exists(self):
+        linux = [p for p in _FINGERPRINT_PROFILES if p["ua_os"] == "linux"]
+        assert linux and linux[0]["platform"] == "Linux x86_64"
+
+    def test_profile_matches_ua_os(self):
+        from master_fetch.browser import _generate_fingerprint_profile, _os_from_ua
+        ua = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36"
+        for _ in range(20):
+            p = _generate_fingerprint_profile(_os_from_ua(ua))
+            assert p["ua_os"] == "linux"
+        win_ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36"
+        for _ in range(20):
+            p = _generate_fingerprint_profile(_os_from_ua(win_ua))
+            assert p["ua_os"] == "windows"
+
+    def test_unknown_os_falls_back_to_any(self):
+        from master_fetch.browser import _generate_fingerprint_profile
+        p = _generate_fingerprint_profile(None)
+        assert "platform" in p

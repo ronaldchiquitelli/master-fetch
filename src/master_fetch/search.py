@@ -1063,7 +1063,7 @@ async def smart_search(
                 next_action="Retry, or smart_fetch the source URL first to confirm it is reachable, then call smart_search with mode=find_similar.")
         derived_query = src_title or " ".join(src_text.split()[:8]) or query
         _fs_intent = _detect_intent(derived_query)
-        _fs_engines = list(engines) if engines else list(DEFAULT_ENGINES)
+        _fs_engines: list[str] = list(engines) if engines else list(DEFAULT_ENGINES)
         _fs_specialized: list[str] = []
         _fs_byok_names: list[str] = []
         if engines is None:
@@ -1079,7 +1079,9 @@ async def smart_search(
                 for b in _fs_specialized:
                     if b not in _fs_engines:
                         _fs_engines.append(b)
-        _fs_qmap = _generate_query_map(derived_query, _fs_intent, _fs_engines)
+        # Like regular BYOK search, a single premium provider is the primary
+        # source: do not spend credits on query expansion variants.
+        _fs_qmap = _generate_query_map(derived_query, _fs_intent, _fs_engines) if not _fs_byok_names else {}
         for b in _fs_specialized:
             _fs_qmap[b] = derived_query
         try:
@@ -1091,6 +1093,35 @@ async def smart_search(
             )
         except Exception as e:
             error = redact_api_key(str(e)[:200])
+
+        # BYOK find_similar must have the same sequential failover as regular
+        # search: try each configured provider one at a time, then retain the
+        # keyless pool as the final fallback when all BYOK providers are empty
+        # or blocked. This avoids silently returning no similar pages after the
+        # first configured provider fails.
+        if _fs_byok_names and not ranked:
+            error = ""
+            for next_byok in _fs_byok_names[1:]:
+                try:
+                    ranked, reports = await multi_search(
+                        derived_query, max_results, engines=[next_byok] + _fs_specialized, site=site,
+                        exclude_sites=exclude_sites, region=region, freshness=freshness,
+                        page=page, server=server,
+                    )
+                    if ranked:
+                        break
+                except Exception as e:
+                    error = redact_api_key(str(e)[:200])
+                    continue
+            if not ranked:
+                try:
+                    ranked, reports = await multi_search(
+                        derived_query, max_results, engines=list(DEFAULT_ENGINES), site=site,
+                        exclude_sites=exclude_sites, region=region, freshness=freshness,
+                        page=page, server=server,
+                    )
+                except Exception as e:
+                    error = redact_api_key(str(e)[:200])
         # Rerank candidates against the SOURCE page content (Exa find-similar,
         # local: the cross-encoder scores (source_content, candidate)).
         if _rerank_task:

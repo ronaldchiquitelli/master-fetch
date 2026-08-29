@@ -7,6 +7,7 @@ against real ResponseModel objects. No mocks of the functions themselves.
 """
 
 import pytest
+import asyncio
 from unittest.mock import MagicMock, AsyncMock, patch
 from master_fetch.server import (
     ResponseModel, BulkResponseModel, _is_js_shell, _detect_content_issue, _is_cacheable,
@@ -232,6 +233,34 @@ class TestIsJsShell:
         )
         assert _is_js_shell(result) is False
 
+    def test_pdf_large_body_low_text_not_shell(self):
+        # A scanned PDF has a large binary body but little extractable text;
+        # the HTML text-ratio heuristic must not flag it as a JS shell.
+        result = _make_result(
+            content=["OCR-extracted from scanned PDF\n[No text detected on this page.]"],
+            status=200, fetcher_used="http", total_size_bytes=13264,
+            content_type="application/pdf",
+        )
+        assert _is_js_shell(result) is False
+
+    def test_image_large_body_low_text_not_shell(self):
+        # Same shape for an OCR'd image page: large binary body, short text.
+        result = _make_result(
+            content=["short"],
+            status=200, fetcher_used="http", total_size_bytes=10000,
+            content_type="image/png",
+        )
+        assert _is_js_shell(result) is False
+
+    def test_pdf_with_charset_suffix_not_shell(self):
+        # content_type may carry parameters (e.g. 'application/pdf; qs=0.001').
+        result = _make_result(
+            content=["short"],
+            status=200, fetcher_used="http", total_size_bytes=13264,
+            content_type="application/pdf; qs=0.001",
+        )
+        assert _is_js_shell(result) is False
+
 
 # ─── Content issue detection ───────────────────────────────────────
 
@@ -239,6 +268,17 @@ class TestDetectContentIssue:
 
     def test_clean_content_no_issue(self):
         result = _make_result()
+        assert _detect_content_issue(result) == ""
+
+    def test_pdf_not_flagged_as_js_shell(self):
+        # A scanned PDF that yielded little OCR text must not be relabeled
+        # js_shell_detected by the quality annotator (regression for the
+        # PDF misclassification).
+        result = _make_result(
+            content=["OCR-extracted from scanned PDF\n[No text detected on this page.]"],
+            status=200, fetcher_used="http", total_size_bytes=13264,
+            content_type="application/pdf",
+        )
         assert _detect_content_issue(result) == ""
 
     def test_js_shell_detected(self):
@@ -640,3 +680,39 @@ class TestBrowserDepsNonBlocking:
         before_thread = warm_body.split("asyncio.to_thread")[0] if "asyncio.to_thread" in warm_body else warm_body
         assert "_browser_deps_available" not in before_thread, \
             "_browser_deps_available must not be called before to_thread (blocks event loop)"
+
+
+@pytest.mark.asyncio
+async def test_ensure_auto_session_out_of_band_creator_no_deadlock():
+    """If an out-of-band creator wins between open_session and the
+    re-check, the orphan must be closed OUTSIDE the sessions lock
+    (close_session re-acquires it; the old code deadlocked)."""
+    from master_fetch.server import MasterFetchServer, _SessionEntry
+    from time import time as _now
+    from unittest.mock import AsyncMock
+
+    srv = MasterFetchServer()
+    winner = AsyncMock()
+    winner._is_alive = True
+    winner.close = AsyncMock()
+    loser_entry_holder = {}
+
+    class Sid:
+        session_id = "loser"
+
+    async def fake_open(**kwargs):
+        # Simulate the out-of-band creator winning the race.
+        srv._auto_stealthy_id = "winner"
+        srv._sessions["winner"] = _SessionEntry(winner, "stealthy", _now())
+        loser = AsyncMock()
+        loser._is_alive = True
+        loser.close = AsyncMock()
+        loser_entry_holder["entry"] = _SessionEntry(loser, "stealthy", _now())
+        srv._sessions["loser"] = loser_entry_holder["entry"]
+        return Sid()
+
+    srv.open_session = fake_open
+    sid = await asyncio.wait_for(srv._ensure_auto_session("stealthy"), timeout=5)
+    assert sid == "winner"
+    assert "loser" not in srv._sessions
+    loser_entry_holder["entry"].session.close.assert_awaited_once()

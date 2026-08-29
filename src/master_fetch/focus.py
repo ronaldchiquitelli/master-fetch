@@ -14,12 +14,12 @@ fetches, cache hits, and bulk results alike.
 
 Three improvements over plain BM25:
 
-1. **Heading-aware boosting**: When a markdown heading contains query terms,
-   ALL blocks under that heading (until the next heading) get a 1.5x score boost.
-   Headings define topic boundaries - if a heading says "Model Architecture"
-   and the query mentions "architecture", content under that heading is relevant
-   even if individual paragraphs don't contain the exact word "architecture".
-   No other search tool does this.
+1. **Heading-aware section relevance**: When a markdown heading contains query
+   terms, ALL blocks under that heading (until the next heading) are selected and
+   get a 1.5x score boost. Headings define topic boundaries - if a heading says
+   "Model Architecture" and the query mentions "architecture", content under that
+   heading is relevant even if individual paragraphs don't contain the exact word
+   "architecture". No other search tool does this.
 
 2. **Table/code preservation**: Tables and code blocks get BM25-underweighted
    (table cells are short tokens, code has unusual token distribution). But they
@@ -133,9 +133,11 @@ def focus_content(
 
     Three-pass selection:
     1. BM25 score each block against query terms
-    2. Boost blocks under headings that contain query terms (heading-aware)
+    2. Select and boost blocks under headings that contain query terms
+       (heading-aware section relevance)
     3. Always keep tables/code blocks containing any query term (preservation)
-    Then keep blocks above threshold + heading context, or fallback to top-N.
+    Then keep blocks above threshold + matching sections + heading context, or
+    fall back to top-N.
     """
     if not query or not text or not text.strip():
         return text
@@ -182,11 +184,11 @@ def focus_content(
 
     scores = [score(i) for i in range(n)]
 
-    # ── Pass 2: heading-aware boosting ──────────────────────────────────
-    # When a heading contains query terms, boost all blocks under it until
-    # the next heading at the same or higher level. Headings define topic
-    # boundaries - content under a matching heading is topically relevant
-    # even if individual paragraphs don't contain exact query terms.
+    # ── Pass 2: heading-aware section relevance ─────────────────────────
+    # A matching heading makes its whole section relevant, even where a child
+    # block has no lexical overlap. A score multiplier alone cannot express that:
+    # 0 * 1.5 remains 0 and the threshold would drop the child.
+    section_blocks: set[int] = set()
     for i in range(n):
         if not _is_heading(blocks[i]):
             continue
@@ -194,12 +196,14 @@ def focus_content(
         if not heading_tokens & qterms:
             continue
         h_level = _heading_level(blocks[i])
+        section_blocks.add(i)
         scores[i] *= 1.5  # boost the heading itself
-        # Boost all following blocks until next heading at same/higher level
+        # Keep and boost blocks until the next heading at the same/higher level.
         for j in range(i + 1, n):
             if _is_heading(blocks[j]) and _heading_level(blocks[j]) <= h_level:
                 break
-            scores[j] *= 1.5  # boost blocks under matching heading
+            section_blocks.add(j)
+            scores[j] *= 1.5
 
     # ── Pass 3: table/code preservation ─────────────────────────────────
     # Tables and code blocks are high-value but BM25-underweighted. If they
@@ -210,9 +214,9 @@ def focus_content(
             if set(block_tokens[i]) & qterms:
                 preserved.add(i)
 
-    # ── Selection: threshold + preserved + heading context ──────────────
+    # ── Selection: threshold + matching sections + preserved + context ───
     keep = [i for i in range(n) if scores[i] >= threshold]
-    keep_set = set(keep) | preserved
+    keep_set = set(keep) | section_blocks | preserved
 
     if not keep_set:
         # Nothing cleared threshold and no preserved blocks - keep the closest

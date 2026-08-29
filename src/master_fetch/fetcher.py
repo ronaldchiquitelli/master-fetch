@@ -15,7 +15,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from typing import Any, Dict, List, Optional, Union
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urljoin
 
 import primp
 
@@ -52,8 +52,9 @@ class ElementWrapper:
             return []
 
     def text_content(self) -> str:
-        """Get all text content from this element."""
-        return self._root.text or ""
+        """Get all text content from this element (full subtree,
+        matching lxml's text_content() semantics)."""
+        return self._root.text_content() if hasattr(self._root, "text_content") else (self._root.text or "")
 
 
 class Response:
@@ -73,7 +74,7 @@ class Response:
 
     __slots__ = (
         "_status", "_url", "_headers", "_body", "_encoding",
-        "_reason", "_cookies", "_root", "_content_cached",
+        "_reason", "_cookies", "_root", "_content_cached", "_captured",
     )
 
     def __init__(
@@ -85,6 +86,7 @@ class Response:
         encoding: str = "utf-8",
         reason: str = "",
         cookies: Optional[Dict[str, str]] = None,
+        captured: Optional[List[Dict[str, Any]]] = None,
     ):
         self._url = url
         self._body = body if isinstance(body, bytes) else (body or b"")
@@ -95,6 +97,9 @@ class Response:
         self._cookies = cookies or {}
         self._root: Any = None  # lazy lxml tree
         self._content_cached: Optional[str] = None
+        # XHR/fetch bodies grabbed during a browser fetch (capture_xhr).
+        # Empty for the HTTP tier, which sees only the document itself.
+        self._captured: List[Dict[str, Any]] = captured or []
 
     # ── Properties matching scrapling's interface ──────────────────
 
@@ -125,6 +130,11 @@ class Response:
     @property
     def cookies(self) -> Dict[str, str]:
         return self._cookies
+
+    @property
+    def captured(self) -> List[Dict[str, Any]]:
+        """XHR/fetch fragments captured during a browser fetch (may be empty)."""
+        return self._captured
 
     @property
     def content(self) -> str:
@@ -221,6 +231,7 @@ async def response_from_browser_page(
     page: Any,
     first_response: Any,
     final_response: Optional[Any],
+    captured: Optional[List[Dict[str, Any]]] = None,
 ) -> Response:
     """Build a Response from a patchright/playwright page + response objects.
 
@@ -250,6 +261,7 @@ async def response_from_browser_page(
             status=0,
             headers={},
             encoding="utf-8",
+            captured=captured,
         )
 
     # Extract headers
@@ -281,6 +293,7 @@ async def response_from_browser_page(
         headers=headers,
         encoding=encoding,
         cookies=cookies,
+        captured=captured,
     )
 
 
@@ -441,25 +454,58 @@ class HTTPSession:
         last_error: Optional[Exception] = None
         for attempt in range(actual_retries + 1):
             try:
-                # primp's get() is synchronous, wrap in to_thread
-                def _do_get():
-                    # Build query params
-                    req_url = url
-                    if params:
-                        from urllib.parse import urlencode
-                        separator = "&" if "?" in req_url else "?"
-                        req_url = f"{req_url}{separator}{urlencode(params)}"
+                # Build initial URL with query params (only on first hop)
+                initial_url = url
+                if params:
+                    from urllib.parse import urlencode
+                    separator = "&" if "?" in initial_url else "?"
+                    initial_url = f"{initial_url}{separator}{urlencode(params)}"
+
+                # primp's get() is synchronous, wrap in to_thread.
+                # ALWAYS pass follow_redirects=False: we follow redirects
+                # manually so each hop is re-validated through the SSRF guard.
+                def _do_get(fetch_url: str):
                     return client.get(
-                        req_url,
+                        fetch_url,
                         headers=final_headers,
                         timeout=actual_timeout,
-                        follow_redirects=follow_redirects,
+                        follow_redirects=False,
                     )
 
-                resp = await asyncio.to_thread(_do_get)
+                current_url = initial_url
+                resp = await asyncio.to_thread(_do_get, current_url)
+
+                # Manual redirect following with SSRF re-validation.
+                # primp followed redirects internally without ever calling
+                # validate_url on the target, so a public URL could 302 into
+                # 127.0.0.1 and bypass the guard entirely.
+                if follow_redirects:
+                    from master_fetch.security import validate_url
+                    hops = 0
+                    while hops < max_redirects:
+                        status = resp.status_code if hasattr(resp, "status_code") else 0
+                        if not (300 <= status < 400):
+                            break
+                        raw_h = dict(resp.headers) if hasattr(resp, "headers") else {}
+                        location = ""
+                        for k, v in raw_h.items():
+                            if k.lower() == "location":
+                                location = v
+                                break
+                        if not location:
+                            break
+                        new_url = urljoin(current_url, location)
+                        # Re-validate each redirect hop through the SSRF guard
+                        await asyncio.to_thread(validate_url, new_url)
+                        resp = await asyncio.to_thread(_do_get, new_url)
+                        current_url = new_url
+                        hops += 1
 
                 # Parse encoding from content-type
-                resp_headers = dict(resp.headers) if hasattr(resp, "headers") else {}
+                # Normalize header names to lowercase: primp/servers vary in
+                # casing, and downstream detection (JSON/PDF/image) does
+                # exact 'content-type' lookups.
+                resp_headers = {str(k).lower(): v for k, v in (dict(resp.headers) if hasattr(resp, "headers") else {}).items()}
                 ct = ""
                 for k, v in resp_headers.items():
                     if k.lower() == "content-type":
@@ -480,7 +526,7 @@ class HTTPSession:
                         pass
 
                 return Response(
-                    url=str(resp.url) if hasattr(resp, "url") else url,
+                    url=str(resp.url) if hasattr(resp, "url") else current_url,
                     body=resp.content if hasattr(resp, "content") else b"",
                     status=resp.status_code if hasattr(resp, "status_code") else 0,
                     headers=resp_headers,
@@ -490,6 +536,11 @@ class HTTPSession:
                 )
 
             except Exception as e:
+                # SecurityError (SSRF guard) must not be retried —
+                # a blocked redirect target should fail fast.
+                from master_fetch.security import SecurityError
+                if isinstance(e, SecurityError):
+                    raise
                 last_error = e
                 if attempt < actual_retries:
                     logger.warning(

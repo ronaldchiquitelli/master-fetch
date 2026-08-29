@@ -1,6 +1,212 @@
 # Changelog
 
-## [Unreleased]
+## [13.2.0] - 2026-08-25
+
+### Added
+
+- **`?stateless=true` query param for HTTP transport**: when present in the
+  query string, a per-request `StreamableHTTPSessionManager` with
+  `stateless=True` is created instead of the shared stateful manager. Default
+  behavior is unchanged. (PR #3 by paulrichmond173-prog)
+
+### Fixed
+
+- **MCP 2026-07-28 stateless spec conformance**: the server now implements
+  `server/discover` (required by the 2026-07-28 spec) and accepts requests
+  without an `initialize` handshake. Previously the server returned "Method not
+  found" for `server/discover` and rejected version-less `tools/list` with
+  "Invalid request parameters". The server is now a dual-era server: legacy
+  clients that send `initialize` get the handshake path; modern clients get
+  stateless mode.
+  - Pinned `mcp>=2.1.1` (has the `server/discover` handler).
+  - `_INIT_EXEMPT` patched to include all spec methods (stateless mode disables
+    the initialization gate; legacy clients still send `initialize` by
+    convention).
+  - `validate_client_request` and `serialize_server_result` patched to fall
+    back to `LATEST_PROTOCOL_VERSION` (2026-07-28) for methods that only exist
+    in the 2026-07-28 surface (e.g. `server/discover`).
+  - Default `_meta` injected for stateless clients that omit it entirely.
+
+## [13.1.2] - 2026-08-12
+
+### Security
+
+- **SSRF filter bypass via HTTP redirect (CWE-918, High)**: The HTTP fetcher
+  (primp) followed redirects internally without re-validating the redirect
+  target through `validate_url`. A public URL that 302-redirected to
+  `http://127.0.0.1/` bypassed the SSRF guard entirely — internal services,
+  admin panels, and cloud metadata endpoints became readable through the
+  tool's normal output. Fix: primp now always gets `follow_redirects=False`;
+  the fetcher reads the `Location` header, re-validates each hop through
+  `validate_url` (with DNS resolution), and re-issues the request manually,
+  capped at 5 hops (was 30). `SecurityError` propagates immediately without
+  retry.
+
+- **SSRF guard DNS-blind bypass (CWE-918, High)**: `validate_url` checked
+  literal IP addresses against private network ranges but never resolved
+  DNS. Any hostname that resolved into private space (e.g. `localtest.me` →
+  `127.0.0.1`) passed validation. Fix: `validate_url` now resolves the
+  hostname via `getaddrinfo` and rejects the request if any A/AAAA record
+  falls in a private network range. This is a partial mitigation — DNS
+  rebinding (TOCTOU between validator resolution and fetcher connection)
+  requires IP pinning or network-layer egress filtering for complete closure.
+
+  Reported by Marwan Abouid (GitHub: marwan1265). 10 regression tests added.
+
+## [13.1.1] - 2026-08-05
+
+### Fixed
+
+- **Scanned PDFs misclassified as JS shells**: `_is_js_shell` now skips
+  non-HTML content types (PDF, images, JSON, feeds). A scanned PDF has a
+  large binary body but little extractable text, which the text-ratio
+  heuristic could not distinguish from an SPA shell. Only applies when
+  content_type is known to be HTML; empty/unknown content_type falls
+  through to the existing logic.
+
+## [13.1.0] - 2026-08-04
+
+### Added
+
+- **XHR capture for AJAX-shell pages**: pages that render a complete-looking
+  document and then fill their data panels over XHR used to come back as
+  `content_ok=True` with none of the data in them — the agent got a confident
+  empty answer. `meteologix.com` was the reference case: 260KB of HTML, 5.6KB
+  of extracted help text, zero temperatures, while the forecast arrived on
+  `/ajax_pub/weather*` after render.
+  - `capture_xhr` (+ `capture_pattern`) collects the page's XHR/fetch bodies
+    into a new `network` field: `{fragments:[{url, status, content_type,
+    size_bytes, text, is_primary, text_truncated}], primary_url,
+    captured_count}`. Fragments are ranked, and the one carrying the page's
+    data is flagged `is_primary`.
+  - Captured data stays out of `content` by default so extraction remains
+    predictable; `fold_captured=true` merges the primary fragment in instead.
+  - Auto-detection: when a page shows unfilled panels *and* the text it gave
+    up carries essentially no figures, smart_fetch re-runs it through the
+    browser with capture on, marks the result `content_ok=false`, and points
+    `next_action` at the fragment holding the data. Both conditions are
+    required — deferred panels alone fire on ordinary pages (GitHub shows ~50
+    of them with its content fully present).
+  - Capture is bounded on every axis (per-fragment bytes, total bytes,
+    fragment count, text length) and filters out analytics, ad, consent-manager
+    (Sourcepoint-style first-party CNAMEs included), bot-challenge and static
+    asset traffic, so only plausible data endpoints are kept.
+  - Data embedded in inline `<script>` literals (chart series, bootstrapped
+    state) is recovered too, and ranked below rendered panels carrying the same
+    numbers.
+  - **Interaction-driven capture**: `capture_xhr` composes with `actions`, so
+    XHRs fired by a click / scroll / tab-switch are captured — data that only
+    loads on interaction. The capture waits for post-interaction requests to
+    settle before snapshotting.
+
+### Changed
+
+- **`actions` now render with resources enabled**: interactions run on a page
+  with stylesheets/images intact instead of the resource-blocked render used
+  for plain fetches. Scroll thresholds and element visibility depend on real
+  layout — with stylesheets blocked, infinite-scroll loaders never fired past
+  page 1. Slower but correct; the non-interactive path still blocks resources.
+- **`{scroll: N}` jumps to the current page bottom each step** instead of a
+  fixed viewport delta. A fixed delta stops re-reaching the bottom once
+  infinite scroll extends the page, so page 2+ never loaded; `scrollTo(
+  scrollHeight)` re-triggers the loader every step and still reveals
+  lazy-loaded content progressively.
+
+## [13.0.1] - 2026-08-03
+
+### Fixed
+
+- **Google search results returned percent-encoded URLs**: `Google.post_extract_results`
+  unwrapped Google's `/url?q=...` redirect with a string split that never
+  percent-decoded the value. Any target URL carrying its own query string
+  (`?id=42`, `?utm_source=...`) came back with `%3F` and `%3D` as literal
+  path characters — a URL that 404s. The fix uses `parse_qs` (which decodes
+  automatically), mirroring the existing `_yahoo_extract_url` path.
+
+## [13.0.0] - 2026-07-30
+
+Hound now runs on the **MCP 2026-07-28 specification** (Python SDK 2.x),
+and the deepest reliability pass in the project's history: every core
+module audited, 20+ bugs fixed from minor to critical. Continues from
+the locked `dondai1234` account; development now lives at
+`dondai44423/master-fetch`.
+
+### Changed
+
+- **Migrated to the MCP Python SDK 2.x** (2026-07-28 spec): the lowlevel
+  `Server` now uses `on_list_tools`/`on_call_tool` constructor handlers,
+  snake_case result fields, and full `CallToolResult` returns. Tool errors
+  are explicitly returned as `is_error=True` results (v2 no longer converts
+  handler exceptions). `mcp` is pinned to `>=2,<3`; the Docker image pins
+  its full dependency resolution via `constraints.txt`.
+
+### Fixed (critical)
+
+- **Stealth tier silently dead on chromium-only Linux**: `_detect_chrome_channel`
+  treated a system `chromium` binary as Google Chrome and selected
+  `channel='chrome'`, which patchright resolves to `/opt/google/chrome/chrome`
+  only. Every stealthy fetch died at launch on chromium-only machines.
+  Detection now requires a real google-chrome binary, and a failed
+  `channel='chrome'` launch falls back to bundled Chromium.
+- **Escalation never fired on transport failure**: an HTTP-tier network
+  error (status 0: TLS fingerprint block, connection reset, timeout) was
+  accepted as success (`0 < 400`) and returned without ever trying the
+  stealthy browser. Status 0 now escalates, except deterministic failures
+  a browser cannot fix either (DNS resolution, connection refused). A
+  stealthy-tier status 0 is likewise no longer silently accepted.
+- **Server deadlock in auto-session creation**: an out-of-band session
+  creator triggered `close_session` inside `_sessions_lock`, which
+  re-acquires the same non-reentrant lock. The orphan session now closes
+  outside the lock.
+- **Fingerprint self-contradiction**: the random platform profile could
+  contradict the sent UA (Windows UA + MacIntel `navigator.platform` =
+  instant WAF flag). The profile is now chosen coherently from the UA's
+  OS before launch, and a Linux profile was added (none existed).
+- **`smart_crawl(sitemap=true)` crashed** with `UnboundLocalError` on
+  sites without a sitemap instead of returning the honest empty response.
+- **Cloudflare solver could recurse forever** on an unsolvable
+  challenge; capped at 3 attempts.
+
+### Fixed (reliability)
+
+- **Nested retry amplification**: `_http_with_retry` wrapped `self.get`'s
+  own retry loop, making 4x4 = 16 identical requests before escalation.
+  The inner loop is disabled in this path; deterministic transport errors
+  (DNS, refused) bail instantly instead of sleeping through backoff.
+- **SQLite lock contention**: `PRAGMA busy_timeout` was only applied to
+  the init connection; every operational connection raced to
+  `database is locked` under concurrent bulk writes. All connections now
+  get `busy_timeout=5000`.
+- **Browser crash during escalation** produced a raw exception instead of
+  the structured all-tiers-failed envelope; the stealthy tier is guarded.
+- **HTTP header casing**: response headers are normalized to lowercase so
+  JSON/PDF/image content-type detection never misses.
+- **MCP argument binding**: optional tool args omitted by the client (or
+  sent as explicit `null`) now fall back to their declared defaults instead
+  of leaking `None` through the binding layer. Flat arguments and the
+  `options` bag are both accepted for every tool; top-level wins.
+- **`find_similar` BYOK failover**: when the first configured BYOK provider
+  returns no results or is blocked, Hound now tries the remaining configured
+  providers sequentially before falling back to keyless search engines.
+- **Focus heading sections**: a matching markdown heading now retains its
+  full section even when child blocks have no direct query-term overlap
+  (multiplying a zero BM25 score by the heading boost stayed zero).
+- `hound --reinstall` now lets pip reinstall dependencies on both POSIX and
+  Windows, repairing missing or broken core dependencies and `[all]` extras.
+- **robots.txt caching**: an unreachable robots.txt is now cached as a miss
+  (5-minute TTL) instead of being re-fetched on every URL check, and
+  concurrent checks on the same domain share a single in-flight fetch.
+- `bulk_stealthy_fetch` no longer counts status 0 as successful;
+  `ElementWrapper.text_content` matches lxml subtree semantics.
+
+### Tests
+
+- 70+ new regression tests: MCP argument binding through the real mcp 2.x
+  protocol layer, status-0 escalation, deterministic-error bail-out,
+  session-lock deadlock, concurrent cache writers, fingerprint coherence,
+  sitemap-empty crawl, Chrome-channel detection + launch fallback.
+  817 total passing.
+
 
 ## [12.4.1] - 2026-07-24
 
