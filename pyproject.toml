@@ -12,13 +12,13 @@ dependencies = [
     # When browser deps are missing, hound runs in HTTP-only mode
     # (see _scrapling_available + _fallback_http_get in server.py).
     # Core deps:
-    # Pin MCP to the 1.x line: the server code uses the legacy decorator API
-    # (@server.list_tools / @server.call_tool) which was removed in MCP SDK 2.x
-    # (renamed to MCPServer + constructor handlers). An unbounded >=1.27.0
-    # resolution pulls 2.x and the container crashes at boot with
-    #   AttributeError: 'Server' object has no attribute 'list_tools'
-    # so keep <2 until the code is migrated to the 2.x API.
-    "mcp>=1.27.0,<2",
+    # MCP SDK 2.x: server.py uses the modern constructor API
+    # (Server(on_list_tools=..., on_call_tool=...), streamable_http_app()),
+    # which was introduced in 2.x. The legacy decorator API
+    # (@server.list_tools / @server.call_tool) that 2.x removed used to crash the
+    # container at boot with AttributeError: 'Server' object has no attribute
+    # 'list_tools', so keep >=2.1.1 to stay on the migrated 2.x line.
+    "mcp>=2.1.1",
     "pydantic>=2.0",
     "trafilatura>=2.0.0",
     "aiosqlite>=0.20.0",

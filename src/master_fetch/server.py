@@ -146,7 +146,6 @@ if TYPE_CHECKING:
     from master_fetch.fetcher import Response as _HoundResponse
     from master_fetch.browser import StealthyBrowser, DynamicBrowser
     from master_fetch.search import SearchResponseModel
-    from mcp.server.fastmcp import Image
     from mcp.types import ImageContent, TextContent
 
 from master_fetch.cache import get_cached, set_cached, clear_cache, clear_all_cache, DEFAULT_TTL
@@ -1698,9 +1697,10 @@ class MasterFetchServer:
         if "bytes" not in captured:
             raise RuntimeError(f"Failed to capture screenshot for {url}")
 
-        from mcp.server.fastmcp import Image  # lazy: fastmcp is ~1s to import, only needed for screenshots
-        from mcp.types import TextContent  # lazy: mcp.types is ~1s; only needed for screenshot output
-        image = Image(data=captured["bytes"], format=image_type).to_image_content()
+        import base64
+        from mcp.types import ImageContent, TextContent  # lazy: only needed for screenshot output
+        image_b64 = base64.b64encode(captured["bytes"]).decode("ascii")
+        image = ImageContent(type="image", data=image_b64, mime_type=f"image/{image_type}")
         return [image, TextContent(type="text", text=captured["url"])]
 
     # ─── HTTP Fetcher (curl_cffi) ─────────────────────────────────
@@ -2975,36 +2975,72 @@ class MasterFetchServer:
         other HTTP MCP clients connect to directly, no proxy needed. The legacy
         SSE transport was removed (deprecated in the spec)."""
         from mcp.server import Server
-        from mcp.types import Tool, TextContent
+        from mcp.types import Tool, ToolAnnotations, ListToolsResult, CallToolResult, TextContent
 
-        server = Server(name="Hound", version=__version__)
-        # Connect-time orientation: clients inject this into the agent context
-        # once on initialize (the MCP `instructions` field).
-        server.instructions = HOUND_INSTRUCTIONS
-        server.website_url = "https://github.com/dondai1234/master-fetch"
+        # MCP SDK 2.x: handlers are constructor params (on_list_tools / on_call_tool)
+        # instead of @server.list_tools() / @server.call_tool() decorators, and both
+        # take (ctx, params) and return fully-formed result objects. The old
+        # decorator API was removed in 2.x (it's what crashed the container with
+        # AttributeError: 'Server' object has no attribute 'list_tools').
 
-        # ── list_tools: return hand-crafted minimal definitions ──────
-        @server.list_tools()
-        async def list_tools():
-            return [Tool(**td) for td in self._TOOL_DEFS]
+        def _build_tool(td: dict) -> Tool:
+            """Convert a v1-style tool definition dict to a v2 ``Tool``.
 
-        # ── call_tool: dispatch to existing methods ─────────────────
-        @server.call_tool(validate_input=False)
-        async def call_tool(name: str, arguments: dict):
-            from mcp.types import CallToolResult
+            ``_TOOL_DEFS`` uses the legacy camelCase keys (``inputSchema``,
+            ``readOnlyHint``, ...); v2 renamed them to snake_case
+            (``input_schema``, ``read_only_hint``, ...).
+            """
+            kwargs = dict(td)
+            if "inputSchema" in kwargs:
+                kwargs["input_schema"] = kwargs.pop("inputSchema")
+            ann = kwargs.get("annotations")
+            if isinstance(ann, dict):
+                kwargs.pop("annotations")
+                _ann_key_map = {
+                    "title": "title",
+                    "readOnlyHint": "read_only_hint",
+                    "destructiveHint": "destructive_hint",
+                    "idempotentHint": "idempotent_hint",
+                    "openWorldHint": "open_world_hint",
+                }
+                kwargs["annotations"] = ToolAnnotations(
+                    **{_ann_key_map.get(k, k): v for k, v in ann.items()}
+                )
+            return Tool(**kwargs)
+
+        async def _list_tools(ctx, params) -> ListToolsResult:
+            # Return hand-crafted minimal tool definitions.
+            return ListToolsResult(
+                tools=[_build_tool(td) for td in self._TOOL_DEFS]
+            )
+
+        async def _call_tool(ctx, params) -> CallToolResult:
+            name = params.name
+            arguments = params.arguments or {}
             try:
                 result = await self._dispatch(name, arguments)
                 # _dispatch returns (content_list, structured_dict) or just content_list
                 if isinstance(result, tuple):
                     content_list, structured = result
-                    return CallToolResult(content=content_list, structuredContent=structured)
+                    return CallToolResult(content=content_list, structured_content=structured)
                 return CallToolResult(content=result)
             except Exception as e:
                 error_text = json.dumps({"error": redact_api_key(str(e)[:300])})
                 return CallToolResult(
                     content=[TextContent(type="text", text=error_text)],
-                    isError=True,
+                    is_error=True,
                 )
+
+        server = Server(
+            "Hound",
+            version=__version__,
+            # Connect-time orientation: clients inject this into the agent context
+            # once on initialize (the MCP `instructions` field).
+            instructions=HOUND_INSTRUCTIONS,
+            website_url="https://github.com/dondai1234/master-fetch",
+            on_list_tools=_list_tools,
+            on_call_tool=_call_tool,
+        )
 
         if not http:
             import anyio
@@ -3051,27 +3087,43 @@ class MasterFetchServer:
             # transport Open WebUI (v0.6.31+) and other modern HTTP MCP clients
             # connect to directly, no mcpo proxy needed. Endpoint: http://host:port/mcp
             from contextlib import asynccontextmanager
-            from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
             from starlette.applications import Starlette
             from starlette.routing import Route
             import uvicorn
 
-            manager = StreamableHTTPSessionManager(app=server)
+            # MCP SDK 2.x: `streamable_http_app()` builds the ASGI app that wires
+            # the streamable-HTTP session manager, the /mcp route, streamable-HTTP
+            # limits and (for localhost hosts) DNS-rebinding protection. It stores
+            # the manager on server._session_manager so its lifespan can be entered
+            # alongside our prewarm/teardown below.
+            inner_app = server.streamable_http_app(streamable_http_path="/mcp", host=host)
+            session_manager = getattr(server, "_session_manager", None)
 
-            class _StreamableHTTPASGIApp:
-                async def __call__(self, scope, receive, send):
-                    await manager.handle_request(scope, receive, send)
+            # Repass the ASGI scope untouched so inner_app handles its own /mcp
+            # routing; this app wrapper only adds our lifespan on top of the SDK's.
+            async def _asgi_entry(scope, receive, send):
+                await inner_app(scope, receive, send)
 
             @asynccontextmanager
             async def lifespan(app):
+                # Warm the single stealthy browser + reranker at startup.
                 warm = asyncio.create_task(self._prewarm_stealthy())
                 warm_reranker = asyncio.create_task(
                     _safe_imported_prewarm("master_fetch.reranker", "prewarm_reranker")
                 )
                 try:
-                    async with manager.run():
+                    # inner_app is mounted as a sub-app so its own lifespan is not
+                    # auto-entered; drive the SDK's session manager manually.
+                    if session_manager is not None:
+                        async with session_manager.run():
+                            yield
+                    else:
                         yield
                 finally:
+                    # Bulletproof teardown: cancel prewarm tasks + close sessions,
+                    # swallowing EVERYTHING (including 'Event loop is closed' and
+                    # BaseException) so the process always exits cleanly. A noisy
+                    # teardown traceback must never look like a server crash.
                     for _t in (warm, warm_reranker):
                         try:
                             _t.cancel()
@@ -3087,7 +3139,10 @@ class MasterFetchServer:
                     except BaseException:
                         pass
 
-            app = Starlette(routes=[Route("/mcp", endpoint=_StreamableHTTPASGIApp())], lifespan=lifespan)
+            app = Starlette(
+                routes=[Route("/{full_path:path}", endpoint=_asgi_entry)],
+                lifespan=lifespan,
+            )
             uvicorn.run(app, host=host, port=port)
 
     async def _dispatch(self, name: str, args: dict) -> list | tuple:
