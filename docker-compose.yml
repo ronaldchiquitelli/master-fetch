@@ -42,6 +42,11 @@ services:
       # Idle browser shutdown (seconds) — the warm stealthy browser closes
       # after this much inactivity and relaunches on the next fetch.
       # HOUND_BROWSER_IDLE_TIMEOUT: "300"
+      # Webshare proxy. PROXY_USER/PROXY_PASS são preenchidos pelo Coolify
+      # (substituição de variáveis via ${VAR} — cria campos editáveis na UI).
+      HTTP_PROXY: "http://${PROXY_USER}:${PROXY_PASS}@p.webshare.io:80"
+      HTTPS_PROXY: "http://${PROXY_USER}:${PROXY_PASS}@p.webshare.io:80"
+      HOUND_SEARCH_PROXY: "http://${PROXY_USER}:${PROXY_PASS}@p.webshare.io:80"
       NO_COLOR: "1"
 
     # ── Older Docker engines only ────────────────────────────────────────
